@@ -44,6 +44,7 @@ If the object can never be exported without a filter, add it to `NOT_EXPORTABLE`
 
 ## Releasing (maintainers)
 
-1. Bump `__version__` in `src/sf_exit/__init__.py` and update `CHANGELOG.md`.
-2. Tag `vX.Y.Z` and push the tag. CI publishes to PyPI and GHCR and creates the GitHub release.
-3. Move the `v0` tag so GitHub Action users get the update: `git tag -f v0 && git push -f origin v0`.
+1. Bump `__version__` in `src/sf_exit/__init__.py`, update `CHANGELOG.md` and merge to `main`.
+2. Publish a GitHub release with tag `vX.Y.Z` (in the UI, or `gh release create vX.Y.Z --generate-notes`).
+3. The release workflow then publishes to PyPI and GHCR, attaches the wheel and sdist, and moves the
+   `v0` tag so GitHub Action users get the update.
