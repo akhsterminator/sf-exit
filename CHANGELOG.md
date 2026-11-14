@@ -24,5 +24,13 @@ First public release.
 - Objects that Salesforce refuses to export unfiltered are reported as skipped (with the reason) instead of failing the run. Permission and limit errors still count as failures.
 - Resuming with different options (for example `--include-deleted`) starts a clean export instead of mixing results.
 - Bulk jobs that don't finish within 6 hours are aborted and reported, instead of being polled forever.
+- `sf-exit audit`: offline data dictionary and org health report (HTML, CSV, Markdown, JSON), covering unused fields, never-ticked checkboxes, unused picklist values, duplicate contacts and accounts, overdue opportunities, records owned by inactive users, stale and empty objects.
+- `--metadata` and `sf-exit metadata`: Apex, Flows, objects, layouts, reports, dashboards, permission sets and more via the Metadata API, as a deployable folder with `package.xml`.
+- `--incremental`: fetch only records changed or deleted since the previous export (`SystemModstamp` + `queryAll`), merge them in, and keep each run's changes in `changes/<timestamp>/`.
+- `sf-exit diff`: records added, removed and changed between two exports, with per-field detail.
+- `sf-exit sql`: query an export with DuckDB immediately, either as a one-off or interactively.
+- `--redact` and `--redact-pii`: consistent salted hashing of chosen or PII fields.
+- `--audit` and `--load` run the audit or a load straight after an export.
+- Recipes: migrate to another CRM, free nightly backups, archive before shutdown, Postgres/DuckDB warehouse.
 
 [0.1.0]: https://github.com/akhsterminator/sf-exit/releases/tag/v0.1.0

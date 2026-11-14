@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import csv
 import datetime as dt
+import hashlib
 import json
+import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -24,6 +26,9 @@ BULK_THRESHOLD = 10_000
 # Long SOQL can't go in a GET URL, so very wide objects always use Bulk (POST).
 MAX_REST_SOQL = 12_000
 CDL_CHUNK = 150
+PII_NAME_PATTERNS = ("*birthdate*", "*ssn*", "*social_security*", "*passport*", "*taxid*",
+                     "*tax_id*", "*national_id*", "*street*", "*postalcode*", "*dateofbirth*",
+                     "*date_of_birth*", "*iban*", "*bank_account*")
 
 
 class Progress:
@@ -51,6 +56,13 @@ class ExportOptions:
     fresh: bool = False
     max_records: Optional[int] = None
     poll_interval: float = 2.0
+    incremental: bool = False  # only fetch rows changed since the previous export
+    redact: Sequence[str] = ()  # "Object.Field" globs to hash, e.g. "Contact.Email", "*.Phone"
+    redact_pii: bool = False  # also hash every email/phone field and common PII names
+    redact_salt: Optional[str] = None
+    metadata: bool = False  # also retrieve configuration via the Metadata API
+    metadata_include: Sequence[str] = ()
+    metadata_exclude: Sequence[str] = ()
 
 
 @dataclass
@@ -63,6 +75,8 @@ class ObjectResult:
     sha256: str = ""
     error: str = ""
     seconds: float = 0.0
+    changed: Optional[int] = None  # incremental runs: rows added/updated/deleted this run
+    redacted: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +87,8 @@ class ExportResult:
     files: Dict[str, Dict[str, int]] = field(default_factory=dict)
     file_errors: int = 0
     api_calls: int = 0
+    incremental_since: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     @property
     def total_rows(self) -> int:
@@ -156,8 +172,12 @@ class Exporter:
         self.data_dir = self.out / "data"
         self.schema_dir = self.out / "schema"
         self.files_dir = self.out / "files"
-        self.state = State(self.out / ".sf-exit" / "state.json", fresh=options.fresh,
+        self.state = State(self.out / ".sf-exit" / "state.json",
+                           fresh=options.fresh or options.incremental,
                            fingerprint={"include_deleted": options.include_deleted})
+        self.incremental: set = set()
+        self.run_stamp = utcnow().replace(":", "").replace("-", "")
+        self.salt = options.redact_salt or secrets.token_hex(16)
         self.result = ExportResult(out_dir=self.out)
         self.plans: Dict[str, ObjectPlan] = {}
 
@@ -201,6 +221,8 @@ class Exporter:
             (self.schema_dir / f"{name}.json").write_text(
                 json.dumps(plan.describe, indent=1, sort_keys=True), "utf-8"
             )
+        if self.opt.incremental and self.opt.data:
+            self._plan_incremental(plans)
 
         if self.opt.data:
             self.export_records(plans)
@@ -208,10 +230,133 @@ class Exporter:
                 self.export_content_document_links()
         if self.opt.files:
             self.export_files()
+        if self.opt.metadata:
+            self.export_metadata()
 
         self.result.api_calls = self.sf.api_calls
         self.write_outputs(started)
         return self.result
+
+    # ------------------------------------------------------------- incremental
+    def _plan_incremental(self, plans: Dict[str, ObjectPlan]) -> None:
+        """Turn plans into 'changes since the last run' queries where that's safe."""
+        prev_path = self.out / "manifest.json"
+        if not prev_path.exists():
+            self.progress.log("[yellow]No previous export here, so this run is a full export.[/]")
+            return
+        prev = json.loads(prev_path.read_text("utf-8"))
+        if bool(prev.get("include_deleted")) != self.opt.include_deleted:
+            self.progress.log("[yellow]--include-deleted changed since the last run: full export.[/]")
+            return
+        started = dt.datetime.fromisoformat(prev["started_at"].replace("Z", "+00:00"))
+        # One hour of overlap absorbs clock skew and in-flight transactions; rows seen
+        # twice are de-duplicated by Id when merging.
+        since = (started - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.result.incremental_since = since
+        prev_objs = prev.get("objects", {})
+        for name, plan in plans.items():
+            dest = self.data_dir / f"{name}.csv"
+            if (prev_objs.get(name, {}).get("status") != "done" or not dest.exists()
+                    or "SystemModstamp" not in plan.field_types or plan.where_variants):
+                continue
+            with open(dest, newline="", encoding="utf-8") as fh:
+                header = next(csv.reader(fh), [])
+            if header != plan.fields:
+                continue  # fields were added/removed: re-export this object in full
+            plan.base_where = f"SystemModstamp > {since}"
+            plan.query_all = True  # also returns rows deleted since then (IsDeleted = true)
+            plan.approx_rows = None  # the delta is usually small: let REST batch it
+            self.incremental.add(name)
+        self.progress.phase(f"Incremental: {len(self.incremental)} objects fetch only changes "
+                            f"since {since}; {len(plans) - len(self.incremental)} in full")
+
+    def _merge_delta(self, plan: ObjectPlan, delta: Path, dest: Path) -> tuple:
+        """Apply changed/deleted rows from ``delta`` onto ``dest``. Returns (rows, changed)."""
+        with open(delta, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, [])
+            changes = {row[0]: row for row in reader if row}
+        if not changes:
+            delta.unlink()
+            with open(dest, newline="", encoding="utf-8") as fh:
+                return max(sum(1 for _ in csv.reader(fh)) - 1, 0), 0
+        deleted_col = header.index("IsDeleted") if "IsDeleted" in header else None
+        snapshot = self.out / "changes" / self.run_stamp / f"{plan.name}.csv"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        merged = dest.with_name(dest.name + ".merge")
+        rows = 0
+        with open(dest, newline="", encoding="utf-8") as src, \
+                open(merged, "w", newline="", encoding="utf-8") as out:
+            reader = csv.reader(src)
+            writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+            writer.writerow(next(reader, header))
+            for row in reader:
+                if row and row[0] not in changes:
+                    writer.writerow(row)
+                    rows += 1
+            for row in changes.values():
+                is_deleted = deleted_col is not None and row[deleted_col].lower() == "true"
+                if is_deleted and not self.opt.include_deleted:
+                    continue
+                writer.writerow(row)
+                rows += 1
+        merged.replace(dest)
+        delta.replace(snapshot)
+        return rows, len(changes)
+
+    # --------------------------------------------------------------- redaction
+    def _redacted_fields(self, plan: ObjectPlan) -> List[str]:
+        if not (self.opt.redact or self.opt.redact_pii):
+            return []
+        out = []
+        for f in plan.fields:
+            if f == "Id" or plan.field_types.get(f) in ("id", "reference"):
+                continue
+            qualified = f"{plan.name}.{f}"
+            explicit = bool(self.opt.redact) and _matches(qualified, self.opt.redact)
+            pii = self.opt.redact_pii and (plan.field_types.get(f) in ("email", "phone")
+                                           or _matches(f, PII_NAME_PATTERNS))
+            if explicit or pii:
+                out.append(f)
+        return out
+
+    def _redact(self, plan: ObjectPlan, path: Path) -> List[str]:
+        cols = self._redacted_fields(plan)
+        if not cols:
+            return []
+        tmp = path.with_name(path.name + ".redact")
+        with open(path, newline="", encoding="utf-8") as src, \
+                open(tmp, "w", newline="", encoding="utf-8") as out:
+            reader = csv.reader(src)
+            writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+            header = next(reader, [])
+            writer.writerow(header)
+            idx = [header.index(c) for c in cols if c in header]
+            for row in reader:
+                for i in idx:
+                    if i < len(row) and row[i]:
+                        digest = hashlib.sha256((self.salt + row[i].strip().lower()).encode())
+                        row[i] = "redacted:" + digest.hexdigest()[:16]
+                writer.writerow(row)
+        tmp.replace(path)
+        return cols
+
+    # ---------------------------------------------------------------- metadata
+    def export_metadata(self) -> None:
+        from sf_exit.metadata import export_metadata
+
+        self.progress.phase("Retrieving metadata (Apex, Flows, layouts, reports, permissions…)")
+        try:
+            res = export_metadata(self.sf, self.out, self.opt.metadata_include,
+                                  self.opt.metadata_exclude, poll_interval=self.opt.poll_interval,
+                                  on_progress=self.progress.phase)
+        except SalesforceError as exc:
+            self.progress.log(f"[red]Metadata export failed:[/] {exc}")
+            self.result.metadata = {"error": str(exc)}
+            return
+        self.result.metadata = {"types": res.types, "components": res.components,
+                                "files": res.files, "failed_types": res.failed_types,
+                                "warnings": len(res.warnings)}
 
     # ----------------------------------------------------------------- records
     def _wanted(self, name: str) -> bool:
@@ -235,11 +380,14 @@ class Exporter:
         )
         # Small objects: first page of up to 25 objects per API call (composite batch).
         # Big objects: one Bulk API job each, largest first so long jobs start early.
-        batchable = [p for p in todo if self._batchable(p)]
+        batchable = sorted((p for p in todo if self._batchable(p)), key=self._all)
         singles = sorted((p for p in todo if not self._batchable(p)),
                          key=lambda p: -(p.approx_rows or 0))
-        batches = [batchable[i:i + COMPOSITE_BATCH_SIZE]
-                   for i in range(0, len(batchable), COMPOSITE_BATCH_SIZE)]
+        batches = []
+        for flag in (False, True):  # a composite batch uses one endpoint (query or queryAll)
+            group = [p for p in batchable if self._all(p) == flag]
+            batches += [group[i:i + COMPOSITE_BATCH_SIZE]
+                        for i in range(0, len(group), COMPOSITE_BATCH_SIZE)]
         self.progress.start("records", "Objects", len(todo))
         with ThreadPoolExecutor(max_workers=max(1, self.opt.workers)) as pool:
             futures = [pool.submit(self.export_object, plan) for plan in singles]
@@ -252,6 +400,10 @@ class Exporter:
                     self.progress.advance("records", 1)
         self.progress.finish("records", "done")
 
+    def _all(self, plan: ObjectPlan) -> bool:
+        """Whether to use queryAll (deleted + archived rows) for this plan."""
+        return plan.query_all if plan.query_all is not None else self.opt.include_deleted
+
     def _batchable(self, plan: ObjectPlan) -> bool:
         return (self._choose_engine(plan) == "rest" and not plan.where_variants
                 and len(plan.soql()) <= MAX_REST_SOQL)
@@ -259,7 +411,7 @@ class Exporter:
     def export_batch(self, plans: List[ObjectPlan]) -> List[ObjectResult]:
         """Fetch the first page of up to 25 small objects in a single API call, then
         follow pagination per object. Anything that errors goes the normal route."""
-        endpoint = "queryAll" if self.opt.include_deleted else "query"
+        endpoint = "queryAll" if self._all(plans[0]) else "query"
         try:
             pages = self.sf.composite_get(
                 [f"{endpoint}?q={quote(p.soql(), safe='')}" for p in plans])
@@ -277,7 +429,7 @@ class Exporter:
             self.progress.start(key, plan.name, plan.approx_rows)
             try:
                 rows = write_records_csv(
-                    self.sf.query(plan.soql(), self.opt.include_deleted, first_page=body),
+                    self.sf.query(plan.soql(), self._all(plan), first_page=body),
                     plan.fields, tmp, on_rows=lambda n, k=key: self.progress.advance(k, n))
             except SalesforceError:
                 tmp.unlink(missing_ok=True)
@@ -289,12 +441,20 @@ class Exporter:
 
     def _done(self, plan: ObjectPlan, tmp: Path, dest: Path, key: str, rows: int,
               engine: str, t0: dt.datetime) -> ObjectResult:
-        tmp.replace(dest)
-        self.progress.finish(key, "done", f"{rows:,} row{'' if rows == 1 else 's'} via {engine}")
+        redacted = self._redact(plan, tmp)
+        changed = None
+        if plan.name in self.incremental:
+            rows, changed = self._merge_delta(plan, tmp, dest)
+            detail = f"{changed:,} changed · {rows:,} total"
+        else:
+            tmp.replace(dest)
+            detail = f"{rows:,} row{'' if rows == 1 else 's'} via {engine}"
+        self.progress.finish(key, "done", ("0 rows " if changed == 0 else "") + detail)
         return ObjectResult(
             plan.name, "done", rows=rows, engine=engine,
             file=str(dest.relative_to(self.out)), sha256=file_sha256(dest),
-            seconds=(dt.datetime.now() - t0).total_seconds(),
+            seconds=(dt.datetime.now() - t0).total_seconds(), changed=changed,
+            redacted=redacted,
         )
 
     def _choose_engine(self, plan: ObjectPlan) -> str:
@@ -350,7 +510,7 @@ class Exporter:
 
         if engine == "bulk":
             return self.sf.bulk_query_to_file(
-                plan.soql(), tmp, include_deleted=self.opt.include_deleted,
+                plan.soql(), tmp, include_deleted=self._all(plan),
                 poll_interval=self.opt.poll_interval, max_records=self.opt.max_records,
                 on_rows=bump,
             )
@@ -361,14 +521,14 @@ class Exporter:
             if len(failures) == len(plan.where_variants):
                 raise failures[0]
             return rows
-        records = self.sf.query(plan.soql(), include_deleted=self.opt.include_deleted)
+        records = self.sf.query(plan.soql(), include_deleted=self._all(plan))
         return write_records_csv(records, plan.fields, tmp, on_rows=bump)
 
     def _variant_records(self, plan: ObjectPlan,
                          failures: List[SalesforceError]) -> Iterator[Dict[str, Any]]:
         for where in plan.where_variants:
             try:
-                yield from self.sf.query(plan.soql(where), include_deleted=self.opt.include_deleted)
+                yield from self.sf.query(plan.soql(where), include_deleted=self._all(plan))
             except SalesforceError as exc:
                 failures.append(exc)
 
@@ -389,12 +549,18 @@ class Exporter:
         self.plans["ContentDocumentLink"] = plan
         (self.schema_dir / "ContentDocumentLink.json").write_text(
             json.dumps(desc, indent=1, sort_keys=True), "utf-8")
-        with open(src, newline="", encoding="utf-8") as fh:
-            ids = [row["Id"] for row in csv.DictReader(fh) if row.get("Id")]
-        key = "obj:ContentDocumentLink"
-        self.progress.start(key, "ContentDocumentLink", None)
         dest = self.data_dir / "ContentDocumentLink.csv"
         tmp = dest.with_name(dest.name + ".part")
+        # Incremental runs only re-query links of documents that changed since last time;
+        # the weekly full export picks up links added to old documents.
+        partial = self._changed_document_ids(dest, plan)
+        if partial is not None:
+            ids = sorted(partial)
+        else:
+            with open(src, newline="", encoding="utf-8") as fh:
+                ids = [row["Id"] for row in csv.DictReader(fh) if row.get("Id")]
+        key = "obj:ContentDocumentLink"
+        self.progress.start(key, "ContentDocumentLink", None)
 
         def records() -> Iterable[Dict[str, Any]]:
             for i in range(0, len(ids), CDL_CHUNK):
@@ -411,13 +577,52 @@ class Exporter:
             self.progress.finish(key, "failed", str(exc))
             r = ObjectResult("ContentDocumentLink", "failed", error=str(exc))
         else:
-            tmp.replace(dest)
+            if partial is not None:
+                rows = self._merge_links(dest, tmp, partial)
+            else:
+                tmp.replace(dest)
             self.progress.finish(key, "done", f"{rows:,} row{'' if rows == 1 else 's'} via rest")
             r = ObjectResult("ContentDocumentLink", "done", rows=rows, engine="rest",
                              file=str(dest.relative_to(self.out)), sha256=file_sha256(dest),
                              seconds=(dt.datetime.now() - t0).total_seconds())
         self.result.objects["ContentDocumentLink"] = r
         self.state.put(r)
+
+    def _changed_document_ids(self, dest: Path, plan: ObjectPlan) -> Optional[set]:
+        if "ContentDocument" not in self.incremental or not dest.exists():
+            return None
+        with open(dest, newline="", encoding="utf-8") as fh:
+            if next(csv.reader(fh), []) != plan.fields:
+                return None
+        snap = self.out / "changes" / self.run_stamp / "ContentDocument.csv"
+        if not snap.exists():
+            return set()
+        with open(snap, newline="", encoding="utf-8") as fh:
+            return {row["Id"] for row in csv.DictReader(fh) if row.get("Id")}
+
+    def _merge_links(self, dest: Path, fresh: Path, doc_ids: set) -> int:
+        """Replace the links of ``doc_ids`` in ``dest`` with the freshly queried ones."""
+        merged = dest.with_name(dest.name + ".merge")
+        rows = 0
+        with open(dest, newline="", encoding="utf-8") as old, \
+                open(fresh, newline="", encoding="utf-8") as new, \
+                open(merged, "w", newline="", encoding="utf-8") as out:
+            reader, writer = csv.reader(old), csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+            header = next(reader, [])
+            writer.writerow(header)
+            doc_col = header.index("ContentDocumentId")
+            for row in reader:
+                if row and row[doc_col] not in doc_ids:
+                    writer.writerow(row)
+                    rows += 1
+            new_reader = csv.reader(new)
+            next(new_reader, None)
+            for row in new_reader:
+                writer.writerow(row)
+                rows += 1
+        merged.replace(dest)
+        fresh.unlink()
+        return rows
 
     # ------------------------------------------------------------------- files
     def _file_jobs(self) -> List[Dict[str, Any]]:
@@ -545,6 +750,11 @@ class Exporter:
             "instance_url": self.sf.instance_url,
             "api_version": self.sf.api_version,
             "include_deleted": self.opt.include_deleted,
+            "incremental_since": self.result.incremental_since,
+            "changes_dir": (f"changes/{self.run_stamp}" if self.result.incremental_since
+                            and (self.out / "changes" / self.run_stamp).exists() else None),
+            "redacted": {n: r.redacted for n, r in self.result.objects.items() if r.redacted},
+            "metadata": self.result.metadata,
             "all_file_versions": self.opt.all_file_versions,
             "api_calls": self.sf.api_calls,
             "totals": {

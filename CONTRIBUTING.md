@@ -23,8 +23,19 @@ ruff check .      # lint
 | `src/sf_exit/schema.py` | DDL for each SQL dialect and the Mermaid ERD |
 | `src/sf_exit/loader.py` | `sf-exit load` targets |
 | `src/sf_exit/verify.py` | Offline and live verification |
+| `src/sf_exit/metadata.py` | Metadata API (SOAP) describe, list and retrieve |
+| `src/sf_exit/audit.py` | The offline audit: findings, data dictionary and the HTML report template |
+| `src/sf_exit/diff.py` | Comparing two exports |
+| `src/sf_exit/sql.py` | DuckDB views over an export |
 | `src/sf_exit/cli.py` | Click commands and Rich output |
-| `tests/fake_org.py` | A fake org that speaks enough of the Salesforce API to test everything |
+| `tests/fake_org.py` | A fake org that speaks enough of the Salesforce API (REST, Bulk 2.0, composite, Metadata SOAP) to test everything |
+| `scripts/record_demo.py` | Regenerates the README's demo SVGs and screenshots |
+
+## Ideas that make great first contributions
+
+- A new audit finding in `audit.py`, for example "Leads that match an existing Contact by email" or "fields with a single distinct value".
+- A recipe in `docs/recipes/` for a CRM or warehouse you know well.
+- An object that fails in your org, added to `NOT_EXPORTABLE` or handled properly.
 
 ## Found an object that fails to export?
 

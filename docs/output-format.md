@@ -32,6 +32,22 @@ To find the files attached to a record, join `ContentDocumentLink.LinkedEntityId
 
 Machine-readable: tool version, org, API version, totals, and for each object its status, row count, engine and SHA-256. It also lists skipped objects and why, plus per-kind file totals.
 
+## `metadata/` (with `--metadata`)
+
+A standard Metadata API folder: `package.xml` plus one directory per type (`classes/`, `triggers/`, `flows/`, `objects/`, `layouts/`, `reports/`…). Deploy it with `sf project deploy start --metadata-dir`, or convert it to source format with `sf project convert mdapi`. Problems are listed in `metadata/retrieve-warnings.txt`.
+
+## `changes/<timestamp>/` (with `--incremental`)
+
+For each object, the rows that were added, updated or deleted in that incremental run, in the same CSV format as `data/`. Deleted rows have `IsDeleted = "true"`. These snapshots are the history of your org: keep them and you can see what any record looked like on any night.
+
+## `audit/` (with `--audit` or `sf-exit audit`)
+
+`index.html` (interactive report), `data-dictionary.csv`, `findings.md` and `audit.json`. See [audit.md](audit.md).
+
+## Redacted values
+
+With `--redact` or `--redact-pii`, chosen fields hold `redacted:<16 hex>` instead of the value. `manifest.json` → `redacted` lists which fields were hashed in each object.
+
 ## `.sf-exit/state.json`
 
 Resume bookkeeping. You can delete it, or pass `--fresh`, to start over.
