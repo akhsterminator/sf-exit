@@ -50,6 +50,8 @@ class FakeOrg(BaseAdapter):
         self.bulk_unsupported = set()
         self.requires_filter = set()
         self.polls_before_complete = 1
+        self.composite = True
+        self.denied = set()  # objects the user has no access to (INSUFFICIENT_ACCESS)
 
     # ------------------------------------------------------------ fixtures
     def add_object(self, name: str, fields: List[Dict], records: List[Dict], custom=None,
@@ -134,6 +136,22 @@ class FakeOrg(BaseAdapter):
         m = re.fullmatch(r"/(query|queryAll)/cursor-(\d+)-(.+)", rest)
         if m:
             return 200, self._query(unquote(m.group(3)), m.group(1) == "queryAll", int(m.group(2))), {}
+        if rest == "/composite/batch" and method == "POST":
+            if not self.composite:
+                raise _SfErr(404, "NOT_FOUND", "The requested resource does not exist")
+            results = []
+            for sub in body["batchRequests"]:
+                u = urlparse("/services/data/" + sub["url"])
+                sub_qs = {k: v[0] for k, v in parse_qs(u.query).items()}
+                try:
+                    st, payload, _ = self.route(sub["method"], unquote(u.path), sub_qs, None)
+                    if isinstance(payload, (bytes, bytearray)):
+                        payload = payload.decode()
+                except _SfErr as e:
+                    st, payload = e.status, [{"message": e.msg, "errorCode": e.code}]
+                results.append({"statusCode": st, "result": payload})
+            return 200, {"hasErrors": any(r["statusCode"] >= 400 for r in results),
+                         "results": results}, {}
         if rest == "/jobs/query" and method == "POST":
             return 200, self._create_job(body), {}
         m = re.fullmatch(r"/jobs/query/(\w+)", rest)
@@ -167,6 +185,8 @@ class FakeOrg(BaseAdapter):
     def _select(self, soql, include_deleted):
         fields, name, where = self._parse(soql)
         obj = self._obj(name)
+        if name in self.denied:
+            raise _SfErr(403, "INSUFFICIENT_ACCESS", f"insufficient access rights on {name}")
         if name in self.requires_filter and not where:
             raise _SfErr(400, "MALFORMED_QUERY",
                          f"Implementation restriction: {name} requires a filter by Id")
@@ -182,6 +202,9 @@ class FakeOrg(BaseAdapter):
 
     @staticmethod
     def _where(rec, where):
+        m = re.fullmatch(r"(\w+) = '([^']*)'", where)
+        if m:
+            return rec.get(m.group(1)) == m.group(2)
         m = re.fullmatch(r"(\w+) = (true|false)", where)
         if m:
             return bool(rec.get(m.group(1))) == (m.group(2) == "true")
@@ -355,6 +378,12 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
                     {"Id": _id("015", 2), "FolderId": _id("00l", 1), "Name": "Website", "Type": None,
                      "BodyLength": 0, "Url": "https://acme.example", "IsDeleted": False}])
     org.blobs[f"Document/{_id('015', 1)}"] = b"DOCX"
+
+    # Knowledge: Salesforce insists on a PublishStatus filter
+    org.add_object("FAQ__kav", STD + [F("Title"), F("PublishStatus", "picklist"), F("Answer__c", "textarea")],
+                   [{"Id": _id("ka0", i), "Title": f"FAQ {i}", "PublishStatus": st, "IsDeleted": False}
+                    for i, st in enumerate(["Online", "Online", "Draft", "Archived"], start=1)])
+    org.requires_filter.add("FAQ__kav")
 
     # Quirky objects sf-exit has to cope with
     org.add_object("Vote", STD, [{"Id": _id("0Vo", 1)}])  # requires a filter: on the deny-list

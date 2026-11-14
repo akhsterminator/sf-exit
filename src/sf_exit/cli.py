@@ -154,6 +154,9 @@ class RichProgress(Progress):
             name = key[4:]
             if status == "failed":
                 self.console.print(f"  [red]✗[/] {name:<40} [red]{detail[:160]}[/]")
+            elif status in ("skipped", "retry"):
+                if self.verbose and status == "skipped":
+                    self.console.print(f"  [dim]– {name:<40} not exportable: {detail[:120]}[/]")
             elif self.verbose or not detail.startswith("0 rows"):
                 self.console.print(f"  [green]✓[/] {name:<40} [dim]{detail}[/]")
         else:
@@ -245,6 +248,10 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
         f"  API calls {result.api_calls:,}\n"
         f"  Output    [bold]{out_dir}[/]  (see REPORT.md)"
     )
+    unexportable = sum(1 for o in result.objects.values() if o.status == "skipped")
+    if unexportable:
+        summary += (f"\n  [dim]{unexportable + len(result.skipped)} system objects skipped "
+                    "(Salesforce doesn't allow exporting them), listed in REPORT.md[/]")
     if result.failed:
         summary += f"\n\n  [red]{len(result.failed)} object(s) failed[/]; re-run to retry, details in REPORT.md"
     if result.file_errors:

@@ -95,7 +95,8 @@ Use it to **migrate** to another CRM, **archive** an org before you shut it down
 ## Features
 
 - **Complete by default.** It finds every queryable object (standard, custom, history, activities, Chatter, email, custom metadata) and every field. It also explains anything it skips in `REPORT.md`.
-- **Fast on big orgs.** Large objects go through **Bulk API 2.0** and small ones through REST, several objects at a time. Wide objects that can't fit in a URL switch to Bulk automatically. If Bulk refuses an object, it falls back to REST.
+- **Fast on big orgs and light on API limits.** Large objects go through **Bulk API 2.0**, several at a time. Small objects are described and fetched **25 per API call** using composite requests, so a typical org's hundreds of small objects cost dozens of calls, not a thousand. If Bulk refuses an object, it falls back to REST.
+- **Handles Salesforce's quirks.** Knowledge articles (`__kav`, which need a status filter) and `ContentDocumentLink` (which needs an Id filter) are exported anyway. System objects that can't be exported are skipped with the reason, instead of failing your run.
 - **Files that stay connected.** ContentVersion, Attachment and Document bodies are downloaded in parallel, checked against Salesforce's own MD5 checksum, and mapped back to their records via `ContentDocumentLink` and `files/index.csv`.
 - **Resumable.** Press Ctrl-C, lose Wi-Fi or hit an API limit, then run the same command again. Finished objects and files are skipped.
 - **Deleted and archived records** with `--include-deleted` (Recycle Bin, archived activities).
@@ -177,7 +178,7 @@ jobs:
           SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
           SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
           SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: salesforce-backup, path: sf-export, retention-days: 30 }
 ```
 
@@ -203,7 +204,7 @@ flowchart LR
 
 <details><summary><b>Will this use up my API limits?</b></summary>
 
-Usually not by much. A Bulk API job costs a handful of calls whatever its size. Small objects cost one call per 2,000 rows, and each file costs one call. `sf-exit plan` estimates the total and shows your remaining daily allowance before you start. Use `--workers 1` to go gently on a busy org.
+Usually not by much. A Bulk API job costs a handful of calls whatever its size. Small objects are fetched 25 per call, and each file costs one call. `sf-exit plan` estimates the total and shows your remaining daily allowance before you start. Use `--workers 1` to go gently on a busy org.
 </details>
 
 <details><summary><b>How long does it take?</b></summary>

@@ -90,7 +90,7 @@ def verify_live(client: SalesforceClient, export_dir: Path,
         if obj["status"] != "done" or name == "ContentDocumentLink":
             continue
         try:
-            live = client.count(name, include_deleted=deleted)
+            live = _live_count(client, export_dir, name, deleted)
             ok = live == obj["rows"]
             detail = "" if ok else f"{live - obj['rows']:+,} since export"
             c = Check(name, "records", obj["rows"], live, ok, detail)
@@ -99,3 +99,24 @@ def verify_live(client: SalesforceClient, export_dir: Path,
         checks.append(c)
         emit(c)
     return checks
+
+
+def _live_count(client: SalesforceClient, export_dir: Path, name: str, deleted: bool) -> int:
+    """COUNT() the object, using the same mandatory filters the export used (e.g. Knowledge)."""
+    from sf_exit.discovery import plan_object
+
+    schema = export_dir / "schema" / f"{name}.json"
+    variants = []
+    if schema.exists():
+        variants = plan_object(json.loads(schema.read_text("utf-8"))).where_variants
+    if not variants:
+        return client.count(name, include_deleted=deleted)
+    total, errors = 0, []
+    for where in variants:
+        try:
+            total += client.count(name, include_deleted=deleted, where=where)
+        except SalesforceError as exc:
+            errors.append(exc)
+    if len(errors) == len(variants):
+        raise errors[0]
+    return total

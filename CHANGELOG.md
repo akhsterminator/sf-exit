@@ -19,5 +19,10 @@ First public release.
 - `sf-exit plan` (dry run with API-limit estimate) and `sf-exit doctor` (permission check).
 - Login via Salesforce CLI, access token, OAuth client credentials, JWT bearer or username-password.
 - GitHub Action and Docker image.
+- Composite batch requests: describes and small-object queries are fetched 25 per API call.
+- Knowledge articles (`KnowledgeArticleVersion`, `*__kav`) are exported per `PublishStatus`.
+- Objects that Salesforce refuses to export unfiltered are reported as skipped (with the reason) instead of failing the run. Permission and limit errors still count as failures.
+- Resuming with different options (for example `--include-deleted`) starts a clean export instead of mixing results.
+- Bulk jobs that don't finish within 6 hours are aborted and reported, instead of being polled forever.
 
 [0.1.0]: https://github.com/akhsterminator/sf-exit/releases/tag/v0.1.0
