@@ -104,7 +104,8 @@ def jwt_flow(cfg: AuthConfig) -> Session:
         raise AuthError("JWT login needs an extra: pip install 'sf-exit[jwt]'") from exc
     with open(cfg.jwt_key_file or "", encoding="utf-8") as fh:
         key = fh.read()
-    audience = SANDBOX_LOGIN if "test.salesforce.com" in cfg.login_url else PRODUCTION_LOGIN
+    sandbox = "test.salesforce.com" in cfg.login_url or ".sandbox.my.salesforce.com" in cfg.login_url
+    audience = SANDBOX_LOGIN if sandbox else PRODUCTION_LOGIN
 
     def fetch() -> dict:
         assertion = jwt.encode(

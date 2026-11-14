@@ -25,6 +25,29 @@ NOT_EXPORTABLE = {
     "EmailStatus": "virtual roll-up",
     "EntityDefinition": "metadata view",
     "EntityParticle": "metadata view",
+    "FeedLike": "requires a filter by Id",
+    "FeedTrackedChange": "requires a filter by Id (changes are in the *History objects)",
+    "NewsFeed": "requires a filter (personal feed view)",
+    "UserProfileFeed": "requires a WITH UserId clause (personal feed view)",
+    "ApexTypeImplementor": "requires a filter (metadata view)",
+    "FlowVariableView": "requires a filter (metadata view)",
+    "FlowVersionView": "requires a filter (metadata view)",
+    "RelatedListDefinition": "requires a filter (metadata view)",
+    "RelatedListColumnDefinition": "requires a filter (metadata view)",
+    "SiteDetail": "requires a filter",
+    "NetworkUserHistoryRecent": "requires a filter",
+    "PlatformEventUsageMetric": "requires a filter",
+    "DatacloudCompany": "external Data.com data",
+    "DatacloudContact": "external Data.com data",
+    "DatacloudDandBCompany": "external Data.com data",
+    "DatacloudOwnedEntity": "external Data.com data",
+    "DatacloudPurchaseUsage": "external Data.com data",
+    "DcSocialProfile": "external data",
+    "DcSocialProfileHandle": "external data",
+    "FormulaFunction": "metadata view",
+    "FormulaFunctionAllowedType": "metadata view",
+    "FormulaFunctionCategory": "metadata view",
+    "FormulaOperator": "metadata view",
     "FieldDefinition": "metadata view",
     "FieldSecurityClassification": "metadata view",
     "FlexQueueItem": "transient Apex queue",
@@ -71,6 +94,9 @@ class ObjectPlan:
     field_types: Dict[str, str] = field(default_factory=dict)
     approx_rows: Optional[int] = None
     describe: Dict[str, Any] = field(default_factory=dict)
+    # Objects Salesforce only returns with a mandatory filter are exported as the union of
+    # several filtered queries (e.g. Knowledge articles: one query per PublishStatus).
+    where_variants: List[str] = field(default_factory=list)
 
     def soql(self, where: str = "") -> str:
         q = f"SELECT {', '.join(self.fields)} FROM {self.name}"
@@ -133,11 +159,41 @@ def plan_object(describe: Dict[str, Any]) -> ObjectPlan:
     if "Id" in fields:  # keep Id first: friendlier CSVs and primary keys
         fields.remove("Id")
         fields.insert(0, "Id")
+    name = describe["name"]
+    variants: List[str] = []
+    if (name == "KnowledgeArticleVersion" or name.endswith("__kav")) and "PublishStatus" in types:
+        variants = [f"PublishStatus = '{s}'" for s in ("Online", "Draft", "Archived")]
     return ObjectPlan(
-        name=describe["name"],
-        label=describe.get("label", describe["name"]),
+        name=name,
+        label=describe.get("label", name),
         custom=bool(describe.get("custom")),
         fields=fields,
         field_types=types,
         describe=describe,
+        where_variants=variants,
     )
+
+
+# Errors meaning "Salesforce will never return this object as a plain bulk export", as
+# opposed to transient or permission problems. Such objects are reported as skipped.
+_NOT_EXPORTABLE_HINTS = (
+    "implementation restriction",
+    "requires a filter",
+    "must filter",
+    "with userid",
+    "not supported by the bulk api",  # only meaningful once REST has also failed
+    "invalid_type_for_operation",
+    "functionality_not_enabled",
+    "not supported",
+    "external object",
+    "big object",
+    "when retrieving results with metadata or fullname fields",
+    "invalid_type",
+)
+
+
+def is_not_exportable(message: str) -> bool:
+    m = message.lower()
+    if "insufficient_access" in m or "request_limit_exceeded" in m or "invalid_session" in m:
+        return False
+    return any(h in m for h in _NOT_EXPORTABLE_HINTS)

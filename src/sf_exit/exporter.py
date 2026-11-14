@@ -10,11 +10,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence
+from urllib.parse import quote
 
 from sf_exit import __version__
-from sf_exit.client import SalesforceClient, SalesforceError, soql_quote
-from sf_exit.discovery import ObjectPlan, plan_object, select_objects
+from sf_exit.client import COMPOSITE_BATCH_SIZE, SalesforceClient, SalesforceError, soql_quote
+from sf_exit.discovery import ObjectPlan, _matches, is_not_exportable, plan_object, select_objects
 from sf_exit.schema import DIALECTS, mermaid_erd, schema_sql
 from sf_exit.utils import file_sha256, human_bytes, safe_filename, utcnow
 
@@ -55,7 +56,7 @@ class ExportOptions:
 @dataclass
 class ObjectResult:
     name: str
-    status: str  # done | failed | skipped
+    status: str  # done | failed | skipped (Salesforce won't export it)
     rows: int = 0
     engine: str = ""
     file: str = ""
@@ -85,13 +86,18 @@ class ExportResult:
 class State:
     """Resumable progress, stored in <out>/.sf-exit/state.json."""
 
-    def __init__(self, path: Path, fresh: bool = False):
+    def __init__(self, path: Path, fresh: bool = False, fingerprint: Optional[Dict] = None):
         self.path = path
         self.lock = threading.Lock()
-        self.data: Dict[str, Any] = {"objects": {}}
+        self.fingerprint = fingerprint or {}
+        self.data: Dict[str, Any] = {"objects": {}, "options": self.fingerprint}
         if path.exists() and not fresh:
             with contextlib.suppress(ValueError):
-                self.data = json.loads(path.read_text("utf-8"))
+                loaded = json.loads(path.read_text("utf-8"))
+                # Resuming with different options (e.g. --include-deleted) would mix
+                # incompatible files, so start over in that case.
+                if loaded.get("options", {}) == self.fingerprint:
+                    self.data = loaded
 
     def get(self, name: str) -> Optional[Dict[str, Any]]:
         return self.data["objects"].get(name)
@@ -150,7 +156,8 @@ class Exporter:
         self.data_dir = self.out / "data"
         self.schema_dir = self.out / "schema"
         self.files_dir = self.out / "files"
-        self.state = State(self.out / ".sf-exit" / "state.json", fresh=options.fresh)
+        self.state = State(self.out / ".sf-exit" / "state.json", fresh=options.fresh,
+                           fingerprint={"include_deleted": options.include_deleted})
         self.result = ExportResult(out_dir=self.out)
         self.plans: Dict[str, ObjectPlan] = {}
 
@@ -167,17 +174,17 @@ class Exporter:
         self.progress.phase(f"Describing {len(names)} objects")
         self.progress.start("describe", "Reading schema", len(names))
         plans: Dict[str, ObjectPlan] = {}
-        with ThreadPoolExecutor(max_workers=max(1, self.opt.workers * 2)) as pool:
-            futures = {pool.submit(self.sf.describe, n): n for n in names}
-            for fut in as_completed(futures):
-                name = futures[fut]
-                try:
-                    plan = plan_object(fut.result())
-                    plan.approx_rows = counts.get(name)
-                    plans[name] = plan
-                except SalesforceError as exc:
-                    self.result.skipped[name] = f"describe failed: {exc}"
-                self.progress.advance("describe", 1)
+        chunks = [names[i:i + COMPOSITE_BATCH_SIZE] for i in range(0, len(names), COMPOSITE_BATCH_SIZE)]
+        with ThreadPoolExecutor(max_workers=max(1, self.opt.workers)) as pool:
+            for described in pool.map(self.sf.describe_many, chunks):
+                for name, body in described.items():
+                    if isinstance(body, SalesforceError):
+                        self.result.skipped[name] = f"describe failed: {body}"
+                    else:
+                        plan = plan_object(body)
+                        plan.approx_rows = counts.get(name)
+                        plans[name] = plan
+                self.progress.advance("describe", len(described))
         self.progress.finish("describe", "done")
         self.plans = dict(sorted(plans.items(), key=lambda kv: kv[0].lower()))
         return self.plans
@@ -208,8 +215,6 @@ class Exporter:
 
     # ----------------------------------------------------------------- records
     def _wanted(self, name: str) -> bool:
-        from sf_exit.discovery import _matches
-
         if self.opt.include and not _matches(name, self.opt.include):
             return False
         return not (self.opt.exclude and _matches(name, self.opt.exclude))
@@ -228,19 +233,73 @@ class Exporter:
             f"Exporting records from {len(todo)} objects"
             + (f" ({resumed} already done, resuming)" if resumed else "")
         )
-        # Largest first so the long Bulk jobs start early and run in parallel.
-        todo.sort(key=lambda p: -(p.approx_rows or 0))
+        # Small objects: first page of up to 25 objects per API call (composite batch).
+        # Big objects: one Bulk API job each, largest first so long jobs start early.
+        batchable = [p for p in todo if self._batchable(p)]
+        singles = sorted((p for p in todo if not self._batchable(p)),
+                         key=lambda p: -(p.approx_rows or 0))
+        batches = [batchable[i:i + COMPOSITE_BATCH_SIZE]
+                   for i in range(0, len(batchable), COMPOSITE_BATCH_SIZE)]
         self.progress.start("records", "Objects", len(todo))
         with ThreadPoolExecutor(max_workers=max(1, self.opt.workers)) as pool:
-            futures = [pool.submit(self.export_object, plan) for plan in todo]
+            futures = [pool.submit(self.export_object, plan) for plan in singles]
+            futures += [pool.submit(self.export_batch, batch) for batch in batches]
             for fut in as_completed(futures):
                 res = fut.result()
-                self.result.objects[res.name] = res
-                self.state.put(res)
-                self.progress.advance("records", 1)
+                for r in res if isinstance(res, list) else [res]:
+                    self.result.objects[r.name] = r
+                    self.state.put(r)
+                    self.progress.advance("records", 1)
         self.progress.finish("records", "done")
 
+    def _batchable(self, plan: ObjectPlan) -> bool:
+        return (self._choose_engine(plan) == "rest" and not plan.where_variants
+                and len(plan.soql()) <= MAX_REST_SOQL)
+
+    def export_batch(self, plans: List[ObjectPlan]) -> List[ObjectResult]:
+        """Fetch the first page of up to 25 small objects in a single API call, then
+        follow pagination per object. Anything that errors goes the normal route."""
+        endpoint = "queryAll" if self.opt.include_deleted else "query"
+        try:
+            pages = self.sf.composite_get(
+                [f"{endpoint}?q={quote(p.soql(), safe='')}" for p in plans])
+        except SalesforceError:
+            return [self.export_object(p) for p in plans]
+        results = []
+        for plan, (ok, body) in zip(plans, pages, strict=True):
+            if not ok:
+                results.append(self.export_object(plan))
+                continue
+            t0 = dt.datetime.now()
+            key = f"obj:{plan.name}"
+            dest = self.data_dir / f"{plan.name}.csv"
+            tmp = dest.with_name(dest.name + ".part")
+            self.progress.start(key, plan.name, plan.approx_rows)
+            try:
+                rows = write_records_csv(
+                    self.sf.query(plan.soql(), self.opt.include_deleted, first_page=body),
+                    plan.fields, tmp, on_rows=lambda n, k=key: self.progress.advance(k, n))
+            except SalesforceError:
+                tmp.unlink(missing_ok=True)
+                self.progress.finish(key, "retry")
+                results.append(self.export_object(plan))
+                continue
+            results.append(self._done(plan, tmp, dest, key, rows, "rest", t0))
+        return results
+
+    def _done(self, plan: ObjectPlan, tmp: Path, dest: Path, key: str, rows: int,
+              engine: str, t0: dt.datetime) -> ObjectResult:
+        tmp.replace(dest)
+        self.progress.finish(key, "done", f"{rows:,} row{'' if rows == 1 else 's'} via {engine}")
+        return ObjectResult(
+            plan.name, "done", rows=rows, engine=engine,
+            file=str(dest.relative_to(self.out)), sha256=file_sha256(dest),
+            seconds=(dt.datetime.now() - t0).total_seconds(),
+        )
+
     def _choose_engine(self, plan: ObjectPlan) -> str:
+        if plan.where_variants:
+            return "rest"
         if self.opt.engine in ("bulk", "rest"):
             engine = self.opt.engine
         else:
@@ -256,9 +315,12 @@ class Exporter:
         key = f"obj:{plan.name}"
         self.progress.start(key, plan.name, plan.approx_rows)
         engine = self._choose_engine(plan)
-        errors = []
+        errors: List[SalesforceError] = []
         rows = None
-        for attempt_engine in ([engine, "rest"] if engine == "bulk" else ["rest", "bulk"]):
+        attempts = [engine, "rest"] if engine == "bulk" else ["rest", "bulk"]
+        if plan.where_variants:
+            attempts = ["rest"]
+        for attempt_engine in attempts:
             if attempt_engine == "rest" and len(plan.soql()) > MAX_REST_SOQL:
                 continue
             try:
@@ -266,21 +328,21 @@ class Exporter:
                 engine = attempt_engine
                 break
             except SalesforceError as exc:
-                errors.append(f"{attempt_engine}: {exc}")
+                exc.message = f"{attempt_engine}: {exc.message}"
+                errors.append(exc)
                 if not _worth_retrying_other_engine(exc):
                     break
+        if rows is not None:
+            return self._done(plan, tmp, dest, key, rows, engine, t0)
+        tmp.unlink(missing_ok=True)
         secs = (dt.datetime.now() - t0).total_seconds()
-        if rows is None:
-            tmp.unlink(missing_ok=True)
-            msg = " | ".join(errors) or "unknown error"
-            self.progress.finish(key, "failed", msg)
-            return ObjectResult(plan.name, "failed", error=msg, seconds=secs)
-        tmp.replace(dest)
-        self.progress.finish(key, "done", f"{rows:,} row{'' if rows == 1 else 's'} via {engine}")
-        return ObjectResult(
-            plan.name, "done", rows=rows, engine=engine,
-            file=str(dest.relative_to(self.out)), sha256=file_sha256(dest), seconds=secs,
-        )
+        msg = " | ".join(f"[{e.code}] {e.message}" if e.code else e.message for e in errors)
+        msg = msg or "unknown error"
+        if errors and all(is_not_exportable(f"{e.code} {e.message}") for e in errors):
+            self.progress.finish(key, "skipped", msg)
+            return ObjectResult(plan.name, "skipped", error=msg, seconds=secs)
+        self.progress.finish(key, "failed", msg)
+        return ObjectResult(plan.name, "failed", error=msg, seconds=secs)
 
     def _run_engine(self, engine: str, plan: ObjectPlan, tmp: Path, key: str) -> int:
         def bump(n: int) -> None:
@@ -292,8 +354,23 @@ class Exporter:
                 poll_interval=self.opt.poll_interval, max_records=self.opt.max_records,
                 on_rows=bump,
             )
+        if plan.where_variants:
+            failures: List[SalesforceError] = []
+            rows = write_records_csv(self._variant_records(plan, failures), plan.fields, tmp,
+                                     on_rows=bump)
+            if len(failures) == len(plan.where_variants):
+                raise failures[0]
+            return rows
         records = self.sf.query(plan.soql(), include_deleted=self.opt.include_deleted)
         return write_records_csv(records, plan.fields, tmp, on_rows=bump)
+
+    def _variant_records(self, plan: ObjectPlan,
+                         failures: List[SalesforceError]) -> Iterator[Dict[str, Any]]:
+        for where in plan.where_variants:
+            try:
+                yield from self.sf.query(plan.soql(where), include_deleted=self.opt.include_deleted)
+            except SalesforceError as exc:
+                failures.append(exc)
 
     def export_content_document_links(self) -> None:
         """ContentDocumentLink (which file is attached to which record) can't be queried
@@ -496,6 +573,7 @@ def render_report(m: Dict[str, Any]) -> str:
     t = m["totals"]
     objs = [o for o in m["objects"].values() if o["status"] == "done"]
     failed = [o for o in m["objects"].values() if o["status"] == "failed"]
+    unexportable = [o for o in m["objects"].values() if o["status"] == "skipped"]
     lines = [
         f"# Salesforce export: {org['name']}",
         "",
@@ -521,10 +599,14 @@ def render_report(m: Dict[str, Any]) -> str:
         lines += ["", "## Failed objects", "", "Re-run the same command to retry just these.", ""]
         for o in failed:
             lines.append(f"- `{o['name']}`: {o['error']}")
-    if m["skipped"]:
-        lines += ["", "<details><summary>Skipped objects</summary>", ""]
+    if m["skipped"] or unexportable:
+        n = len(m["skipped"]) + len(unexportable)
+        lines += ["", f"<details><summary>{n} objects skipped (Salesforce doesn't allow a plain "
+                  "export of them, or you excluded them)</summary>", ""]
         for name, why in m["skipped"].items():
             lines.append(f"- `{name}`: {why}")
+        for o in unexportable:
+            lines.append(f"- `{o['name']}`: {o['error'][:300]}")
         lines += ["", "</details>"]
     lines += [
         "",

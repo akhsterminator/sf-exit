@@ -138,16 +138,58 @@ def test_resume_skips_finished_objects(tmp_path):
     assert len(org.calls) < first_calls
 
 
-def test_failed_object_is_reported_not_fatal(tmp_path):
+def test_unexportable_object_is_skipped_not_failed(tmp_path):
     org = build_org()
     org.requires_filter.add("Contact")
     opts = ExportOptions(out_dir=tmp_path, poll_interval=0, files=False)
     result = Exporter(client_for(org), opts).run()
-    assert result.objects["Contact"].status == "failed"
+    assert result.objects["Contact"].status == "skipped"
     assert "requires a filter" in result.objects["Contact"].error
+    assert not result.failed
     assert result.objects["Account"].status == "done"
     assert not (tmp_path / "data" / "Contact.csv").exists()
+    report = (tmp_path / "REPORT.md").read_text()
+    assert "Failed objects" not in report and "`Contact`" in report
+
+
+def test_permission_error_is_a_real_failure(tmp_path):
+    org = build_org()
+    org.denied.add("Contact")
+    opts = ExportOptions(out_dir=tmp_path, poll_interval=0, files=False)
+    result = Exporter(client_for(org), opts).run()
+    assert result.objects["Contact"].status == "failed"
+    assert "INSUFFICIENT_ACCESS" in result.objects["Contact"].error
     assert "Failed objects" in (tmp_path / "REPORT.md").read_text()
+
+
+def test_knowledge_articles_exported_per_publish_status(exported):
+    _, _, result, out = exported
+    assert result.objects["FAQ__kav"].status == "done"
+    rows = read_csv(out / "data" / "FAQ__kav.csv")
+    assert sorted(r["PublishStatus"] for r in rows) == ["Archived", "Draft", "Online", "Online"]
+
+
+def test_composite_batching_saves_api_calls(tmp_path):
+    calls = {}
+    for composite in (True, False):
+        org = build_org()
+        org.composite = composite
+        sf = client_for(org)
+        opts = ExportOptions(out_dir=tmp_path / str(composite), poll_interval=0, files=False)
+        result = Exporter(sf, opts).run()
+        assert not result.failed
+        calls[composite] = sf.api_calls
+    # 15 objects: describe + first page batched -> far fewer calls
+    assert calls[True] < calls[False] - 20, calls
+
+
+def test_resume_restarts_when_options_change(tmp_path):
+    org = build_org()
+    opts = ExportOptions(out_dir=tmp_path, include=["Account"], poll_interval=0, files=False)
+    Exporter(client_for(org), opts).run()
+    opts.include_deleted = True
+    result = Exporter(client_for(org), opts).run()
+    assert result.objects["Account"].rows == 25  # re-exported, not resumed with 24
 
 
 def test_verify_offline_and_live(exported):
