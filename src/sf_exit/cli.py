@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,6 +32,7 @@ from sf_exit.loader import LoadError, load
 from sf_exit.utils import human_bytes
 
 console = Console(stderr=True, highlight=False)
+stdout = Console(highlight=False)  # query results / diffs: data goes to stdout, chatter to stderr
 
 BANNER = "[bold cyan]sf-exit[/] [dim]v{v}[/]  [dim]·  your Salesforce data, out.[/]"
 
@@ -186,10 +189,17 @@ def cli(ctx, verbose):
 
     \b
     Quick start:
-      sf org login web --alias my-org          # log in once with the Salesforce CLI
-      sf-exit plan   --org my-org              # see what will be exported (read-only)
-      sf-exit export --org my-org -d ./export  # export records + files
-      sf-exit load ./export --to duckdb:///salesforce.duckdb
+      sf org login web --alias my-org            # log in once with the Salesforce CLI
+      sf-exit plan   --org my-org                # what will be exported (read-only)
+      sf-exit export --org my-org -d ./export    # records + files (+ --metadata)
+      sf-exit audit  ./export                    # data dictionary + org health report
+      sf-exit sql    ./export "SELECT ..."       # query it instantly
+      sf-exit load   ./export --to duckdb:///salesforce.duckdb
+
+    \b
+    Backups:
+      sf-exit export --org my-org -d ./backup --incremental   # only what changed
+      sf-exit diff ./backup-monday ./backup-tuesday            # what changed between two
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
@@ -215,12 +225,25 @@ def cli(ctx, verbose):
 @click.option("--workers", default=4, show_default=True, help="Objects exported in parallel.")
 @click.option("--file-workers", default=8, show_default=True, help="Parallel file downloads.")
 @click.option("--fresh", is_flag=True, help="Ignore previous progress and re-export everything.")
+@click.option("--incremental", is_flag=True,
+              help="Only fetch records changed or deleted since the last export into this folder.")
+@click.option("--metadata", is_flag=True,
+              help="Also export configuration (Apex, Flows, layouts, reports, permissions…).")
+@click.option("--metadata-type", "metadata_types", multiple=True, metavar="TYPE",
+              help="Only these metadata types (glob, repeatable): --metadata-type 'Apex*'.")
+@click.option("--redact", multiple=True, metavar="OBJECT.FIELD",
+              help="Hash these fields (glob, repeatable): --redact 'Contact.Email' --redact '*.Phone'.")
+@click.option("--redact-pii", is_flag=True,
+              help="Hash every email and phone field plus common PII (birthdate, SSN, street…).")
+@click.option("--audit", "run_audit_after", is_flag=True,
+              help="Build the audit report (data dictionary + findings) when the export finishes.")
 @click.option("--load", "load_to", metavar="TARGET",
               help="After exporting, load into e.g. duckdb:///sf.duckdb (see `sf-exit load`).")
 @click.pass_context
 @handle_errors
 def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only, all_file_versions,
-           engine, workers, file_workers, fresh, load_to, **auth):
+           engine, workers, file_workers, fresh, incremental, metadata, metadata_types, redact,
+           redact_pii, run_audit_after, load_to, **auth):
     """Export every record, file and attachment to a folder of CSVs + files.
 
     Safe to interrupt: re-running the same command resumes and skips finished objects.
@@ -232,6 +255,9 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
         out_dir=Path(out_dir), include=include, exclude=exclude, include_deleted=include_deleted,
         engine=engine, workers=workers, file_workers=file_workers, files=not no_files,
         data=not files_only, all_file_versions=all_file_versions, fresh=fresh,
+        incremental=incremental, metadata=metadata or bool(metadata_types),
+        metadata_include=metadata_types, redact=redact, redact_pii=redact_pii,
+        redact_salt=os.environ.get("SF_EXIT_REDACT_SALT"),
     )
     t0 = time.time()
     with RichProgress(console, verbose=ctx.obj["verbose"]) as progress:
@@ -241,13 +267,21 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
     done = [o for o in result.objects.values() if o.status == "done"]
     files = sum(v["count"] for v in result.files.values())
     fbytes = sum(v["bytes"] for v in result.files.values())
-    summary = (
-        f"[bold green]Export complete[/] in {_dur(elapsed)}\n\n"
-        f"  Records   [bold]{result.total_rows:,}[/] from {len(done):,} objects\n"
-        f"  Files     [bold]{files:,}[/] ({human_bytes(fbytes)})\n"
-        f"  API calls {result.api_calls:,}\n"
-        f"  Output    [bold]{out_dir}[/]  (see REPORT.md)"
-    )
+    lines = [f"[bold green]Export complete[/] in {_dur(elapsed)}", "",
+             f"  Records   [bold]{result.total_rows:,}[/] from {len(done):,} objects"]
+    if result.incremental_since:
+        changed = sum(o.changed or 0 for o in done)
+        lines.append(f"  Changed   [bold]{changed:,}[/] records since {result.incremental_since}")
+    if opts.files:
+        lines.append(f"  Files     [bold]{files:,}[/] ({human_bytes(fbytes)})")
+    if result.metadata and "components" in result.metadata:
+        lines.append(f"  Metadata  [bold]{result.metadata['components']:,}[/] components, "
+                     f"{result.metadata['files']:,} files in metadata/")
+    redacted = sum(len(o.redacted) for o in done)
+    if redacted:
+        lines.append(f"  Redacted  {redacted:,} fields hashed")
+    lines += [f"  API calls {result.api_calls:,}", f"  Output    [bold]{out_dir}[/]  (see REPORT.md)"]
+    summary = "\n".join(lines)
     unexportable = sum(1 for o in result.objects.values() if o.status == "skipped")
     if unexportable:
         summary += (f"\n  [dim]{unexportable + len(result.skipped)} system objects skipped "
@@ -258,10 +292,13 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
         summary += f"\n  [red]{result.file_errors} file(s) failed[/]; see files/index.csv"
     console.print(Panel.fit(summary, border_style="green" if not result.failed else "yellow"))
 
+    if run_audit_after and opts.data:
+        ctx.invoke(audit, export_dir=out_dir, out=None, open_report=False)
     if load_to:
         ctx.invoke(load_cmd, export_dir=out_dir, to=load_to, lowercase=False, replace=True, only=())
-    elif not result.failed:
-        console.print(f"Next: [bold]sf-exit load {out_dir} --to duckdb:///salesforce.duckdb[/]")
+    elif not result.failed and opts.data:
+        console.print(f"Next: [bold]sf-exit audit {out_dir}[/] · [bold]sf-exit sql {out_dir}[/] · "
+                      f"[bold]sf-exit load {out_dir} --to duckdb:///sf.duckdb[/]")
     if result.failed:
         sys.exit(1)
 
@@ -488,6 +525,221 @@ def doctor(**auth):
     console.print(table)
     if any(ok is False for _, ok, _ in rows):
         sys.exit(1)
+
+
+# ------------------------------------------------------------------- audit
+@cli.command()
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("-o", "--out", type=click.Path(file_okay=False),
+              help="Where to write the report (default: <export>/audit).")
+@click.option("--open", "open_report", is_flag=True, help="Open the HTML report in your browser.")
+@handle_errors
+def audit(export_dir, out, open_report):
+    """Data dictionary + org health report (unused fields, duplicates, stale pipeline…).
+
+    Works offline on an export folder: no Salesforce connection, nothing leaves your machine.
+    """
+    from sf_exit.audit import run_audit
+
+    console.print(f"[cyan]›[/] Auditing [bold]{export_dir}[/]")
+    with console.status("Reading every record…"):
+        report = run_audit(Path(export_dir), Path(out) if out else None)
+    s = report["summary"]
+    target = Path(out) if out else Path(export_dir) / "audit"
+    sev_style = {"high": "red", "medium": "yellow", "low": "blue", "info": "dim"}
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    for f in report["findings"][:12]:
+        st = sev_style[f["severity"]]
+        table.add_row(f"[{st}]●[/]", f"[{st}]{f['severity'].upper():<6}[/]", f["title"])
+    console.print(
+        f"[bold]{s['records']:,}[/] records · [bold]{s['objects_with_data']:,}[/] objects with data · "
+        f"[bold]{s['custom_fields']:,}[/] custom fields"
+    )
+    if report["findings"]:
+        console.print(table)
+    else:
+        console.print("[green]No findings. Tidy org![/]")
+    console.print(
+        f"\n[bold green]Report:[/] {target / 'index.html'}\n"
+        f"        [dim]{target / 'data-dictionary.csv'} · {target / 'findings.md'} · "
+        f"{target / 'audit.json'}[/]"
+    )
+    if open_report:
+        import webbrowser
+
+        webbrowser.open((target / "index.html").resolve().as_uri())
+
+
+# --------------------------------------------------------------------- sql
+@cli.command("sql")
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("query", required=False)
+@click.option("--format", "fmt", type=click.Choice(["table", "csv", "json"]), default="table",
+              show_default=True)
+@click.option("--limit", default=100, show_default=True, help="Max rows to show in table format (0 = all).")
+@handle_errors
+def sql_cmd(export_dir, query, fmt, limit):
+    """Query an export with SQL immediately (DuckDB, no loading step).
+
+    \b
+      sf-exit sql ./export "SELECT StageName, sum(Amount) FROM Opportunity GROUP BY 1"
+      sf-exit sql ./export                      # interactive prompt; .tables lists tables
+    """
+    from sf_exit import sql as sqlmod
+
+    con = sqlmod.connect(Path(export_dir))
+    if query:
+        try:
+            result = sqlmod.run(con, query, 0 if fmt != "table" else limit)
+        except Exception as exc:  # noqa: BLE001 - DuckDB raises many error types
+            console.print(f"[bold red]SQL error:[/] {exc}")
+            console.print("[dim]Tables are named after objects (quote mixed case: \"User\"). "
+                          f"List them with: sf-exit sql {export_dir} then .tables[/]")
+            sys.exit(2)
+        _print_result(*result, fmt=fmt, limit=limit)
+        return
+    console.print("[bold cyan]sf-exit sql[/] · DuckDB over your export. End statements with [bold];[/]"
+                  " · [bold].tables[/] · [bold].quit[/]")
+    buf = ""
+    while True:
+        try:
+            line = input("sf-exit> " if not buf else "    ...> ")
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return
+        cmd = line.strip()
+        if not buf and cmd in (".quit", ".exit", "quit", "exit"):
+            return
+        if not buf and cmd == ".tables":
+            t = Table(show_header=True)
+            t.add_column("Table")
+            t.add_column("Columns", justify="right")
+            for name, ncols in sqlmod.tables(con):
+                t.add_row(name, str(ncols))
+            console.print(t)
+            continue
+        buf += line + "\n"
+        if cmd.endswith(";"):
+            try:
+                _print_result(*sqlmod.run(con, buf, limit), fmt="table", limit=limit)
+            except Exception as exc:  # noqa: BLE001 - show any SQL error and keep the prompt
+                console.print(f"[red]{exc}[/]")
+            buf = ""
+
+
+def _cell(v) -> str:
+    if v is None:
+        return "[dim]NULL[/]"
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        return f"{v:,.0f}" if v.is_integer() else f"{v:,.2f}"
+    return str(v).replace("[", "\\[")
+
+
+def _print_result(cols, rows, fmt="table", limit=100):
+    if fmt == "csv":
+        import csv as _csv
+
+        w = _csv.writer(sys.stdout, lineterminator="\n")
+        w.writerow(cols)
+        w.writerows(rows)
+        return
+    if fmt == "json":
+        click.echo(json.dumps([dict(zip(cols, r, strict=False)) for r in rows], default=str, indent=1))
+        return
+    if not cols:
+        console.print("[dim]OK[/]")
+        return
+    t = Table(show_header=True, header_style="bold")
+    numeric = [bool(rows) and all(isinstance(r[i], (int, float)) and not isinstance(r[i], bool)
+                                  for r in rows if r[i] is not None) for i in range(len(cols))]
+    for c, num in zip(cols, numeric, strict=False):
+        t.add_column(str(c), justify="right" if num else "left")
+    for r in rows:
+        t.add_row(*[_cell(v) for v in r])
+    stdout.print(t)
+    if limit and len(rows) >= limit:
+        console.print(f"[dim](first {limit} rows; use --limit 0 for all)[/]")
+
+
+# -------------------------------------------------------------------- diff
+@cli.command()
+@click.argument("old_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("new_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--details", type=click.Path(file_okay=False), metavar="DIR",
+              help="Write one CSV per object listing every added/removed/changed record and field.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option("--only", multiple=True, metavar="OBJECT", help="Only compare these objects.")
+@handle_errors
+def diff(old_dir, new_dir, details, as_json, only):
+    """What changed between two exports (e.g. last night's backup vs tonight's)."""
+    from dataclasses import asdict
+
+    from sf_exit.diff import diff_exports
+
+    with console.status("Comparing exports…"):
+        diffs = diff_exports(Path(old_dir), Path(new_dir), Path(details) if details else None,
+                             list(only) or None)
+    touched = [d for d in diffs if d.touched]
+    if as_json:
+        click.echo(json.dumps([asdict(d) for d in touched], indent=1))
+        return
+    if not touched:
+        console.print("[green]No differences.[/] Every object has identical records.")
+        return
+    t = Table(title=f"{len(touched)} of {len(diffs)} objects changed", title_justify="left")
+    for col, j in (("Object", "left"), ("Added", "right"), ("Removed", "right"),
+                   ("Changed", "right"), ("Most-changed fields", "left")):
+        t.add_column(col, justify=j)
+    for d in sorted(touched, key=lambda d: -(d.added + d.removed + d.changed)):
+        note = ", ".join(f"{k} ({v:,})" for k, v in list(d.changed_fields.items())[:3])
+        if d.status != "both":
+            note = f"[yellow]{d.status}[/]"
+        elif d.fields_added or d.fields_removed:
+            note = " ".join(filter(None, [
+                ("+" + ", +".join(d.fields_added)) if d.fields_added else "",
+                ("-" + ", -".join(d.fields_removed)) if d.fields_removed else "", note]))
+        t.add_row(d.name, f"[green]{d.added:,}[/]" if d.added else "",
+                  f"[red]{d.removed:,}[/]" if d.removed else "",
+                  f"[yellow]{d.changed:,}[/]" if d.changed else "", note)
+    stdout.print(t)
+    if details:
+        console.print(f"Per-record details in [bold]{details}[/]")
+
+
+# ---------------------------------------------------------------- metadata
+@cli.command("metadata")
+@auth_options
+@click.option("-d", "--out", "out_dir", default="./sf-export", show_default=True,
+              type=click.Path(file_okay=False))
+@click.option("--type", "types", multiple=True, metavar="TYPE",
+              help="Only these metadata types (glob, repeatable): --type ApexClass --type 'Flow*'.")
+@click.option("--exclude-type", "exclude_types", multiple=True, metavar="TYPE")
+@handle_errors
+def metadata_cmd(out_dir, types, exclude_types, **auth):
+    """Export configuration only: Apex, Flows, objects, layouts, reports, permission sets…
+
+    Writes a deployable Metadata API folder to <out>/metadata (use `sf project deploy start
+    --metadata-dir` or `sf project convert mdapi` with it).
+    """
+    from sf_exit.metadata import export_metadata
+
+    console.print(BANNER.format(v=__version__))
+    sf = make_client(auth)
+    _print_org(sf)
+    with console.status("Listing metadata types…") as status:
+        res = export_metadata(sf, Path(out_dir), types, exclude_types,
+                              on_progress=lambda m: status.update(m))
+    console.print(
+        f"[bold green]Metadata exported:[/] {res.components:,} named components across "
+        f"{res.types:,} types, {res.files:,} files → [bold]{Path(out_dir) / 'metadata'}[/]"
+    )
+    if res.failed_types:
+        console.print(f"[yellow]{len(res.failed_types)} type(s) could not be retrieved[/]: "
+                      + ", ".join(sorted(res.failed_types)) + " (see metadata/retrieve-warnings.txt)")
 
 
 def main() -> None:

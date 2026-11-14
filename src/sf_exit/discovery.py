@@ -97,10 +97,17 @@ class ObjectPlan:
     # Objects Salesforce only returns with a mandatory filter are exported as the union of
     # several filtered queries (e.g. Knowledge articles: one query per PublishStatus).
     where_variants: List[str] = field(default_factory=list)
+    # Incremental exports add a filter (SystemModstamp > last run) to every query and
+    # use queryAll so deletions are seen too.
+    base_where: str = ""
+    query_all: Optional[bool] = None
 
     def soql(self, where: str = "") -> str:
         q = f"SELECT {', '.join(self.fields)} FROM {self.name}"
-        return q + (f" WHERE {where}" if where else "")
+        clauses = [c for c in (self.base_where, where) if c]
+        if len(clauses) == 2:
+            return q + f" WHERE ({clauses[0]}) AND ({clauses[1]})"
+        return q + (f" WHERE {clauses[0]}" if clauses else "")
 
 
 def _matches(name: str, patterns: Sequence[str]) -> bool:

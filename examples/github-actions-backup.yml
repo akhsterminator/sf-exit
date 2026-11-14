@@ -1,5 +1,8 @@
 # Nightly Salesforce backup with sf-exit.
 #
+# This keeps each night as a separate full export (simple, artifacts expire).
+# For incremental backups with history in S3, see docs/recipes/nightly-backups.md
+#
 # 1. Put this file in a PRIVATE repository at .github/workflows/salesforce-backup.yml
 # 2. Add repository secrets: SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET
 #    (see https://github.com/akhsterminator/sf-exit/blob/main/docs/authentication.md#client-credentials)
@@ -23,7 +26,7 @@ jobs:
       - name: Export Salesforce
         uses: akhsterminator/sf-exit@v0
         with:
-          args: export -d sf-export --include-deleted --load parquet:///sf-parquet
+          args: export -d sf-export --include-deleted --metadata --audit --load parquet:///sf-parquet
         env:
           SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
           SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}

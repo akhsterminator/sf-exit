@@ -35,7 +35,9 @@ STD = [
     F("CreatedDate", "datetime"),
     F("CreatedById", "reference", referenceTo=["User"]),
     F("LastModifiedDate", "datetime"),
+    F("SystemModstamp", "datetime"),
 ]
+BASE_STAMP = "2024-06-01T00:00:00.000Z"
 
 
 class FakeOrg(BaseAdapter):
@@ -51,6 +53,7 @@ class FakeOrg(BaseAdapter):
         self.requires_filter = set()
         self.polls_before_complete = 1
         self.composite = True
+        self.retrieves: Dict[str, Dict] = {}
         self.denied = set()  # objects the user has no access to (INSUFFICIENT_ACCESS)
 
     # ------------------------------------------------------------ fixtures
@@ -66,6 +69,9 @@ class FakeOrg(BaseAdapter):
             },
             "records": records,
         }
+        if any(f["name"] == "SystemModstamp" for f in fields):
+            for r in records:
+                r.setdefault("SystemModstamp", BASE_STAMP)
 
     def session(self) -> requests.Session:
         s = requests.Session()
@@ -81,7 +87,11 @@ class FakeOrg(BaseAdapter):
         path = unquote(url.path)
         qs = {k: v[0] for k, v in parse_qs(url.query).items()}
         self.calls.append(f"{request.method} {path}")
-        body = json.loads(request.body) if request.body else None
+        raw = request.body.decode() if isinstance(request.body, bytes) else request.body
+        try:
+            body = json.loads(raw) if raw else None
+        except ValueError:
+            body = raw  # SOAP XML
         try:
             status, payload, headers = self.route(request.method, path, qs, body)
         except _SfErr as e:
@@ -107,6 +117,8 @@ class FakeOrg(BaseAdapter):
             return 200, [{"version": "61.0"}, {"version": API}], {}
         if path == "/services/oauth2/userinfo":
             return 200, {"user_id": "005000000000001AAA", "preferred_username": "admin@acme.example"}, {}
+        if path == f"/services/Soap/m/{API}":
+            return self.soap(body)
         if not path.startswith(base):
             raise _SfErr(404, "NOT_FOUND", path)
         rest = path[len(base):]
@@ -202,6 +214,12 @@ class FakeOrg(BaseAdapter):
 
     @staticmethod
     def _where(rec, where):
+        m = re.fullmatch(r"\((.+)\) AND \((.+)\)", where, re.S)
+        if m:
+            return FakeOrg._where(rec, m.group(1)) and FakeOrg._where(rec, m.group(2))
+        m = re.fullmatch(r"(\w+) > (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)", where)
+        if m:
+            return (rec.get(m.group(1)) or "")[:19] > m.group(2)[:19]
         m = re.fullmatch(r"(\w+) = '([^']*)'", where)
         if m:
             return rec.get(m.group(1)) == m.group(2)
@@ -266,6 +284,91 @@ class FakeOrg(BaseAdapter):
         }
 
 
+METADATA_TYPES = {
+    # type: {member: {path: content}}
+    "ApexClass": {"InvoiceService": {"classes/InvoiceService.cls": "public class InvoiceService {}",
+                                     "classes/InvoiceService.cls-meta.xml": "<ApexClass/>"}},
+    "Flow": {"Onboarding": {"flows/Onboarding.flow-meta.xml": "<Flow/>"}},
+    "CustomObject": {"Account": {"objects/Account.object": "<CustomObject/>"},
+                     "Invoice__c": {"objects/Invoice__c.object": "<CustomObject/>"}},
+    "Layout": {"Account-Account Layout": {"layouts/Account-Account Layout.layout": "<Layout/>"}},
+    "Report": {"SalesReports": {"reports/SalesReports-meta.xml": "<ReportFolder/>"},
+               "SalesReports/Pipeline": {"reports/SalesReports/Pipeline.report": "<Report/>"}},
+    "BrokenType": {"X": {"broken/X": "boom"}},
+}
+
+
+def _soap_ok(op, inner):
+    return (f'<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+            f'xmlns="http://soap.sforce.com/2006/04/metadata"><soapenv:Body><{op}Response>{inner}'
+            f'</{op}Response></soapenv:Body></soapenv:Envelope>').encode()
+
+
+def _soap_fault(code, msg):
+    return (f'<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
+            f'<soapenv:Body><soapenv:Fault><faultcode>sf:{code}</faultcode><faultstring>{msg}</faultstring>'
+            f'</soapenv:Fault></soapenv:Body></soapenv:Envelope>').encode()
+
+
+def _soap(self, xml):
+    import base64 as b64
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    root = ET.fromstring(xml)
+    body = [e for e in root.iter() if e.tag.endswith("}Body")][0]
+    op_el = list(body)[0]
+    op = op_el.tag.split("}")[1]
+    txt = lambda el, n: [c.text for c in el.iter() if c.tag.endswith("}" + n)]  # noqa: E731
+    self.calls.append(f"SOAP {op}")
+    if op == "describeMetadata":
+        inner = "<result>" + "".join(
+            f"<metadataObjects><xmlName>{t}</xmlName><inFolder>{'true' if t == 'Report' else 'false'}"
+            "</inFolder></metadataObjects>" for t in METADATA_TYPES) + "</result>"
+        return 200, _soap_ok(op, inner), {"Content-Type": "text/xml"}
+    if op == "listMetadata":
+        out = []
+        for q in [e for e in op_el.iter() if e.tag.endswith("}queries")]:
+            t = txt(q, "type")[0]
+            folder = (txt(q, "folder") or [None])[0]
+            if t == "ReportFolder":
+                names = ["SalesReports"]
+            elif t == "Report":
+                names = [m for m in METADATA_TYPES["Report"] if folder and m.startswith(folder + "/")]
+            else:
+                names = list(METADATA_TYPES.get(t, {}))
+            out += [f"<result><fullName>{n}</fullName><type>{t}</type></result>" for n in names]
+        return 200, _soap_ok(op, "".join(out)), {"Content-Type": "text/xml"}
+    if op == "retrieve":
+        types = {}
+        for t_el in [e for e in op_el.iter() if e.tag.endswith("}types")]:
+            types[txt(t_el, "name")[0]] = txt(t_el, "members")
+        if "BrokenType" in types:
+            return 500, _soap_fault("UNKNOWN_EXCEPTION", "An unexpected error occurred"), {}
+        rid = f"09S{len(self.retrieves):015d}"
+        self.retrieves[rid] = types
+        return 200, _soap_ok(op, f"<result><id>{rid}</id><done>false</done></result>"), {}
+    if op == "checkRetrieveStatus":
+        rid = txt(op_el, "asyncProcessId")[0]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("unpackaged/package.xml", "<Package/>")
+            for t, members in self.retrieves[rid].items():
+                for m, files in METADATA_TYPES.get(t, {}).items():
+                    if "*" in members and t != "Report" or m in members:
+                        for path, content in files.items():
+                            zf.writestr("unpackaged/" + path, content)
+        z = b64.b64encode(buf.getvalue()).decode()
+        inner = (f"<result><done>true</done><status>Succeeded</status><id>{rid}</id>"
+                 f"<messages><fileName>unpackaged/package.xml</fileName><problem>Entity of type "
+                 f"'Layout' named 'Ghost' cannot be found</problem></messages><zipFile>{z}</zipFile></result>")
+        return 200, _soap_ok(op, inner), {}
+    return 500, _soap_fault("INVALID_OPERATION", op), {}
+
+
+FakeOrg.soap = _soap
+
+
 class _SfErr(Exception):
     def __init__(self, status, code, msg):
         self.status, self.code, self.msg = status, code, msg
@@ -325,7 +428,7 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
     org.add_object("Contact", STD + [
         F("FirstName"), F("LastName"), F("Email", "email"), F("Birthdate", "date"),
         F("AccountId", "reference", referenceTo=["Account"]), F("HasOptedOutOfEmail", "boolean"),
-    ], [{"Id": _id("003", i), "FirstName": f"Ada{i}", "LastName": "Lovelace", "Email": f"ada{i}@x.example",
+    ], [{"Id": _id("003", i), "FirstName": f"Ada{i}", "LastName": "Lovelace", "Email": f"ada{i % 36}@x.example",
          "Birthdate": f"1990-01-{1 + i % 28:02d}", "AccountId": _id("001", 1 + i % 24),
          "HasOptedOutOfEmail": i % 2 == 0, "CreatedDate": ts(i), "IsDeleted": False}
         for i in range(1, 40 * scale + 1)])
@@ -336,6 +439,26 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
     ], [{"Id": _id("a01", i), "Name": f"INV-{i:04d}", "Amount__c": 99.5 * i, "Paid__c": i % 3 == 0,
          "Due__c": "2025-06-30", "Account__c": _id("001", i), "CreatedDate": ts(i), "IsDeleted": False}
         for i in range(1, 8 * scale + 1)])
+    stages = ["Prospecting", "Negotiation", "Closed Won", "Closed Lost"]
+    opps = []
+    for i in range(1, 30 * scale + 1):
+        stage = stages[i % 4]
+        opps.append({"Id": _id("006", i), "Name": f"Deal {i}", "AccountId": _id("001", 1 + i % 24),
+                     "StageName": stage, "Amount": float(1000 * (i % 17 + 1)),
+                     "CloseDate": f"20{23 + i % 4}-{1 + i % 12:02d}-15", "IsClosed": stage.startswith("Closed"),
+                     "Legacy_Code__c": "LC-1" if i == 7 else None, "Is_Partner__c": False,
+                     "Tier__c": None, "CreatedDate": ts(i), "IsDeleted": False,
+                     "OwnerId": _id("005", 1 + i % 5)})
+    org.add_object("Opportunity", STD + [
+        F("Name"), F("AccountId", "reference", referenceTo=["Account"]),
+        F("StageName", "picklist", picklistValues=[{"value": v, "active": True} for v in stages + ["Qualification"]]),
+        F("Amount", "currency"), F("CloseDate", "date"), F("IsClosed", "boolean"),
+        F("OwnerId", "reference", referenceTo=["User"]),
+        F("Legacy_Code__c", custom=True, label="Legacy code"),
+        F("Is_Partner__c", "boolean", custom=True, label="Partner deal"),
+        F("Tier__c", "picklist", custom=True, label="Tier", inlineHelpText="Customer tier at signature",
+          picklistValues=[{"value": "Gold", "active": True}, {"value": "Silver", "active": True}]),
+    ], opps)
     org.add_object("Task", STD + [F("Subject"), F("WhatId", "reference", referenceTo=["Account", "Invoice__c"])],
                    [{"Id": _id("00T", i), "Subject": f"Call {i}", "WhatId": _id("001", i), "IsDeleted": False}
                     for i in range(1, 6)])
