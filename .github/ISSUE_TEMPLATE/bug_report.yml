@@ -1,0 +1,36 @@
+name: Bug report
+description: Something didn't export, load or verify correctly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Please don't paste customer data, tokens or org IDs you consider sensitive.**
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: sf-exit export --org prod -x '*History'
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the error, and the relevant lines from REPORT.md if an object failed.
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: sf-exit version
+      placeholder: output of `sf-exit --version`
+    validations: { required: true }
+  - type: dropdown
+    id: edition
+    attributes:
+      label: Salesforce edition
+      options: [Enterprise, Unlimited, Performance, Professional (+API), Developer, Sandbox, Other / not sure]
+  - type: input
+    id: env
+    attributes:
+      label: OS and Python version
+      placeholder: macOS 15, Python 3.12

@@ -1,0 +1,7 @@
+.git
+.venv
+**/__pycache__
+sf-export
+export
+*.duckdb
+*.db

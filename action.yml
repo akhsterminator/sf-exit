@@ -1,0 +1,32 @@
+name: "sf-exit: Salesforce export & backup"
+description: "Export every Salesforce record, file and attachment to CSV/Parquet/SQLite/DuckDB. Read-only, resumable, verifiable."
+author: "sf-exit contributors"
+branding:
+  icon: "log-out"
+  color: "blue"
+
+inputs:
+  args:
+    description: "Arguments for the sf-exit CLI, e.g. 'export -d sf-export' or 'verify sf-export'."
+    required: false
+    default: "export -d sf-export"
+  python-version:
+    description: "Python version to run sf-exit with."
+    required: false
+    default: "3.12"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install sf-exit
+      shell: bash
+      run: python -m pip install --disable-pip-version-check --quiet "${{ github.action_path }}[all]"
+    - name: Run sf-exit
+      shell: bash
+      run: sf-exit ${{ inputs.args }}
+      env:
+        PYTHONUNBUFFERED: "1"
+        COLUMNS: "120"

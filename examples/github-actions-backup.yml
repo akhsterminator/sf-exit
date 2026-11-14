@@ -1,0 +1,55 @@
+# Nightly Salesforce backup with sf-exit.
+#
+# 1. Put this file in a PRIVATE repository at .github/workflows/salesforce-backup.yml
+# 2. Add repository secrets: SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET
+#    (see https://github.com/akhsterminator/sf-exit/blob/main/docs/authentication.md#client-credentials)
+# 3. Optional: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / BACKUP_BUCKET for S3 upload.
+
+name: Salesforce backup
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # every night at 02:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Export Salesforce
+        uses: akhsterminator/sf-exit@v0
+        with:
+          args: export -d sf-export --include-deleted --load parquet:///sf-parquet
+        env:
+          SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+          SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+          SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
+
+      - name: Verify
+        uses: akhsterminator/sf-exit@v0
+        with:
+          args: verify sf-export
+
+      - name: Keep as a workflow artifact (short retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-${{ github.run_id }}
+          path: |
+            sf-export
+            sf-parquet
+          retention-days: 14
+
+      - name: Upload to S3 (optional)
+        if: ${{ env.BACKUP_BUCKET != '' }}
+        env:
+          BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          stamp=$(date -u +%Y-%m-%d)
+          aws s3 sync sf-export  "s3://$BACKUP_BUCKET/salesforce/$stamp/raw/"     --sse AES256
+          aws s3 sync sf-parquet "s3://$BACKUP_BUCKET/salesforce/$stamp/parquet/" --sse AES256
