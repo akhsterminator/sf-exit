@@ -1,0 +1,17 @@
+name: Action smoke test
+
+on:
+  push:
+    branches: [main]
+    paths: ["action.yml", "pyproject.toml"]
+  pull_request:
+    paths: ["action.yml", "pyproject.toml"]
+
+jobs:
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          args: --version
