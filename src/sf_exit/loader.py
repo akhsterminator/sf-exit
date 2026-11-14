@@ -68,7 +68,7 @@ def _rows(table: Table, convert: Callable[[str, str], object]) -> Iterator[Tuple
         reader = csv.reader(fh)
         next(reader, None)
         for row in reader:
-            yield tuple(convert(v, t) for v, t in zip(row, types))
+            yield tuple(convert(v, t) for v, t in zip(row, types, strict=False))
 
 
 def _sqlite_value(v: str, t: str) -> object:
