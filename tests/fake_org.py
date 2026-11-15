@@ -432,6 +432,10 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
          "Birthdate": f"1990-01-{1 + i % 28:02d}", "AccountId": _id("001", 1 + i % 24),
          "HasOptedOutOfEmail": i % 2 == 0, "CreatedDate": ts(i), "IsDeleted": False}
         for i in range(1, 40 * scale + 1)])
+    org.add_object("Lead", STD + [
+        F("FirstName"), F("LastName"), F("Email", "email"), F("IsConverted", "boolean"),
+    ], [{"Id": _id("00Q", 1), "FirstName": "Ada", "LastName": "Lead", "Email": "ADA1@x.example",
+         "IsConverted": False, "CreatedDate": ts(1), "IsDeleted": False}])
     org.add_object("Invoice__c", STD + [
         F("Name"), F("Amount__c", "currency"), F("Paid__c", "boolean"), F("Due__c", "date"),
         F("Account__c", "reference", referenceTo=["Account"], cascadeDelete=True),

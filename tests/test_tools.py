@@ -25,6 +25,9 @@ def export_dir(tmp_path_factory):
 def test_audit_finds_real_problems(export_dir, tmp_path):
     report = run_audit(export_dir, tmp_path / "audit")
     ids = {f["id"]: f for f in report["findings"]}
+    assert ids["lead-contact-overlap"]["count"] == 1
+    assert len(ids["lead-contact-overlap"]["items"]) == 1
+    assert "ada1@x.example" in ids["lead-contact-overlap"]["items"]
     assert "Opportunity.Tier__c (Tier)" in ids["unused-fields"]["items"]
     assert "Opportunity.Is_Partner__c (Partner deal)" in ids["never-checked"]["items"]
     assert any(i.startswith("Opportunity.Legacy_Code__c") for i in ids["rare-fields"]["items"])

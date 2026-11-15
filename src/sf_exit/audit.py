@@ -116,6 +116,7 @@ def analyse_object(export_dir: Path, csv_path: Path, inactive_users: set,
         owner_i = col.get("OwnerId")
         email_i = col.get("Email") if name in ("Contact", "Lead") else None
         acct_name_i = col.get("Name") if name == "Account" else None
+        is_converted_i = col.get("IsConverted") if name == "Lead" else None
         by_year: Counter = Counter()
         owner_inactive = 0
         rows = 0
@@ -146,7 +147,22 @@ def analyse_object(export_dir: Path, csv_path: Path, inactive_users: set,
                     and row[owner_i] in inactive_users:
                 owner_inactive += 1
             if email_i is not None and email_i < len(row) and row[email_i]:
-                dup_keys["email"][row[email_i].strip().lower()] += 1
+                email = row[email_i].strip().lower()
+
+                dup_keys["email"][email] += 1
+
+                if name == "Contact":
+                    dup_keys["contact-email"][email] += 1
+
+                if name == "Lead":
+                    converted = (
+                        is_converted_i is not None
+                        and is_converted_i < len(row)
+                        and row[is_converted_i] == "true"
+                    )
+
+                    if not converted:
+                        dup_keys["lead-email"][email] += 1
             if acct_name_i is not None and acct_name_i < len(row) and row[acct_name_i]:
                 key = _norm_company(row[acct_name_i])
                 if key:
@@ -245,12 +261,25 @@ def findings_for(objects: List[ObjectStats], dup_keys: Dict[str, Counter],
                            "Possibly abandoned. Check before migrating them.", stale, len(stale)))
     dupe_emails = {k: v for k, v in dup_keys["email"].items() if v > 1}
     if dupe_emails:
+
         extra = sum(v - 1 for v in dupe_emails.values())
         items = [f"{k}: {v} records" for k, v in sorted(dupe_emails.items(), key=lambda kv: -kv[1])[:500]]
         out.append(Finding("duplicate-emails", "high",
                            _n(len(dupe_emails), "email address appears", "email addresses appear") + " on more than one Contact/Lead",
                            f"{extra:,} likely duplicate people. Deduplicate before migrating, or the "
                            "duplicates move with you.", items, len(dupe_emails)))
+        lead_contact_overlap = sorted(
+        set(dup_keys["lead-email"])
+        & set(dup_keys["contact-email"])
+    )
+    if lead_contact_overlap:
+        out.append(Finding("lead-contact-overlap", "medium",
+                _n(len(lead_contact_overlap), "unconverted lead matches", "unconverted leads match") + " an existing contact email",
+                "Lead.Email matches Contact.Email case-insensitively for leads that have not been converted.",
+        lead_contact_overlap,
+        len(lead_contact_overlap))
+    )
+
     dupe_accounts = {k: v for k, v in dup_keys["account"].items() if v > 1}
     if dupe_accounts:
         items = [f"{k}: {v} accounts" for k, v in sorted(dupe_accounts.items(), key=lambda kv: -kv[1])[:500]]
