@@ -23,8 +23,13 @@ INSTANCE = "https://acme.my.salesforce.com"
 API = "62.0"
 
 
+SYSTEM_FIELDS = {"Id", "IsDeleted", "CreatedDate", "CreatedById", "LastModifiedDate", "SystemModstamp"}
+
+
 def F(name, type_="string", label=None, **kw):
-    d = {"name": name, "type": type_, "label": label or name, "deprecatedAndHidden": False}
+    d = {"name": name, "type": type_, "label": label or name, "deprecatedAndHidden": False,
+         "createable": name not in SYSTEM_FIELDS, "updateable": name not in SYSTEM_FIELDS,
+         "nillable": True}
     d.update(kw)
     return d
 
@@ -53,19 +58,23 @@ class FakeOrg(BaseAdapter):
         self.requires_filter = set()
         self.polls_before_complete = 1
         self.composite = True
+        self.writes = 0
         self.retrieves: Dict[str, Dict] = {}
         self.denied = set()  # objects the user has no access to (INSUFFICIENT_ACCESS)
 
     # ------------------------------------------------------------ fixtures
     def add_object(self, name: str, fields: List[Dict], records: List[Dict], custom=None,
-                   queryable=True, label=None):
+                   queryable=True, label=None, prefix=None):
+        prefix = prefix or (records[0]["Id"][:3] if records else f"z{len(self.objects):02d}")
         self.objects[name] = {
             "describe": {
                 "name": name,
                 "label": label or name,
                 "custom": name.endswith("__c") if custom is None else custom,
                 "queryable": queryable,
-                "fields": fields,
+                "createable": True,
+                "keyPrefix": prefix,
+                "fields": [dict(f) for f in fields],
             },
             "records": records,
         }
@@ -148,6 +157,8 @@ class FakeOrg(BaseAdapter):
         m = re.fullmatch(r"/(query|queryAll)/cursor-(\d+)-(.+)", rest)
         if m:
             return 200, self._query(unquote(m.group(3)), m.group(1) == "queryAll", int(m.group(2))), {}
+        if rest == "/composite/sobjects" and method in ("POST", "PATCH"):
+            return 200, [self._write(method, dict(r)) for r in body["records"]], {}
         if rest == "/composite/batch" and method == "POST":
             if not self.composite:
                 raise _SfErr(404, "NOT_FOUND", "The requested resource does not exist")
@@ -177,6 +188,41 @@ class FakeOrg(BaseAdapter):
         if m:
             return self._results(self.jobs[m.group(1)], qs)
         raise _SfErr(404, "NOT_FOUND", f"no route for {method} {rest}")
+
+    # -------------------------------------------------------------- writes
+    def _exists(self, record_id):
+        return any(r.get("Id") == record_id for o in self.objects.values() for r in o["records"])
+
+    def _write(self, method, rec):
+        def fail(code, msg):
+            return {"success": False, "errors": [{"statusCode": code, "message": msg}]}
+
+        name = (rec.pop("attributes", None) or {}).get("type")
+        if name not in self.objects:
+            return fail("INVALID_TYPE", f"sObject type '{name}' is not supported")
+        obj = self.objects[name]
+        meta = {f["name"]: f for f in obj["describe"]["fields"]}
+        rid = rec.pop("id", None)
+        for k, v in rec.items():
+            if k not in meta:
+                return fail("INVALID_FIELD", f"No such column '{k}' on sobject of type {name}")
+            if not meta[k].get("createable", True):
+                return fail("INVALID_FIELD_FOR_INSERT_UPDATE", f"Unable to create/update fields: {k}")
+            if meta[k]["type"] == "reference" and not self._exists(v):
+                return fail("INVALID_CROSS_REFERENCE_KEY", f"invalid cross reference id: {k}")
+        if method == "PATCH":
+            target = next((r for r in obj["records"] if r.get("Id") == rid), None)
+            if not target:
+                return fail("ENTITY_IS_DELETED", "entity is deleted")
+            target.update(rec)
+            return {"id": rid, "success": True, "errors": []}
+        for f in meta.values():
+            if not f.get("nillable", True) and f.get("createable", True) and f["name"] not in rec:
+                return fail("REQUIRED_FIELD_MISSING", f"Required fields are missing: [{f['name']}]")
+        self.writes += 1
+        new_id = f"{obj['describe']['keyPrefix']}N{self.writes:011d}AAA"
+        obj["records"].append({"Id": new_id, "IsDeleted": False, **rec})
+        return {"id": new_id, "success": True, "errors": []}
 
     # ---------------------------------------------------------------- soql
     def _obj(self, name):
@@ -405,8 +451,9 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
                                     F("InstanceName"), F("IsSandbox", "boolean")],
                    [{"Id": "00D000000000001AAA", "Name": "Acme Corp", "OrganizationType": "Enterprise Edition",
                      "InstanceName": "EU45", "IsSandbox": False}])
-    org.add_object("User", STD + [F("Name"), F("Email", "email"), F("IsActive", "boolean")],
-                   [{"Id": _id("005", i), "Name": f"User {i}", "Email": f"user{i}@acme.example",
+    org.add_object("User", STD + [F("Name"), F("Username"), F("Email", "email"), F("IsActive", "boolean")],
+                   [{"Id": _id("005", i), "Name": f"User {i}", "Username": f"user{i}@acme.example",
+                     "Email": f"user{i}@acme.example",
                      "IsActive": i != 3, "CreatedDate": ts(i), "IsDeleted": False} for i in range(1, 6)])
     industries = ["Technology", "Retail", "Healthcare", "Finance", None]
     accounts = []
@@ -418,11 +465,13 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
             "Description": "multi\nline, text" if i == 1 else None,
             "CreatedDate": ts(i), "LastModifiedDate": ts(i + 1), "CreatedById": _id("005", 1),
             "IsDeleted": i == 5, "OwnerId": _id("005", 1 + i % 5),
+            "ParentId": _id("001", 24) if i == 1 else (_id("001", 1) if i == 3 else None),
         })
     org.add_object("Account", STD + [
         F("Name"), F("Industry", "picklist"), F("AnnualRevenue", "currency"),
         F("NumberOfEmployees", "int"), F("BillingCity"), F("BillingAddress", "address"),
         F("Description", "textarea"), F("OwnerId", "reference", referenceTo=["User"]),
+        F("ParentId", "reference", referenceTo=["Account"]),
         F("Legacy__c", deprecatedAndHidden=True),
     ], accounts)
     org.add_object("Contact", STD + [
@@ -434,7 +483,7 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
         for i in range(1, 40 * scale + 1)])
     org.add_object("Invoice__c", STD + [
         F("Name"), F("Amount__c", "currency"), F("Paid__c", "boolean"), F("Due__c", "date"),
-        F("Account__c", "reference", referenceTo=["Account"], cascadeDelete=True),
+        F("Account__c", "reference", referenceTo=["Account"], cascadeDelete=True, nillable=False),
         F("Scan__c", "base64"),
     ], [{"Id": _id("a01", i), "Name": f"INV-{i:04d}", "Amount__c": 99.5 * i, "Paid__c": i % 3 == 0,
          "Due__c": "2025-06-30", "Account__c": _id("001", i), "CreatedDate": ts(i), "IsDeleted": False}
@@ -447,6 +496,7 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
                      "StageName": stage, "Amount": float(1000 * (i % 17 + 1)),
                      "CloseDate": f"20{23 + i % 4}-{1 + i % 12:02d}-15", "IsClosed": stage.startswith("Closed"),
                      "Legacy_Code__c": "LC-1" if i == 7 else None, "Is_Partner__c": False,
+                     "Source_System__c": "SFDC",
                      "Tier__c": None, "CreatedDate": ts(i), "IsDeleted": False,
                      "OwnerId": _id("005", 1 + i % 5)})
     org.add_object("Opportunity", STD + [
@@ -455,10 +505,17 @@ def build_org(scale: int = 1, seed: int = 7) -> FakeOrg:
         F("Amount", "currency"), F("CloseDate", "date"), F("IsClosed", "boolean"),
         F("OwnerId", "reference", referenceTo=["User"]),
         F("Legacy_Code__c", custom=True, label="Legacy code"),
+        F("Source_System__c", custom=True, label="Source system"),
         F("Is_Partner__c", "boolean", custom=True, label="Partner deal"),
         F("Tier__c", "picklist", custom=True, label="Tier", inlineHelpText="Customer tier at signature",
           picklistValues=[{"value": "Gold", "active": True}, {"value": "Silver", "active": True}]),
     ], opps)
+    org.add_object("Lead", STD + [F("Name"), F("Company"), F("Email", "email"), F("IsConverted", "boolean"),
+                                  F("Status", "picklist")],
+                   [{"Id": _id("00Q", i), "Name": f"Lead {i}", "Company": f"Prospect {i}",
+                     "Email": f"ada{i}@x.example" if i <= 3 else f"lead{i}@new.example",
+                     "IsConverted": i == 3, "Status": "Open", "IsDeleted": False, "CreatedDate": ts(i)}
+                    for i in range(1, 7 * scale + 1)])
     org.add_object("Task", STD + [F("Subject"), F("WhatId", "reference", referenceTo=["Account", "Invoice__c"])],
                    [{"Id": _id("00T", i), "Subject": f"Call {i}", "WhatId": _id("001", i), "IsDeleted": False}
                     for i in range(1, 6)])

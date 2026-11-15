@@ -13,6 +13,16 @@
 | `audit/findings.md` | Findings as Markdown, ready to paste into a ticket, a PR or a Slack thread |
 | `audit/audit.json` | Everything, machine-readable |
 
+## Health score
+
+Every audit gives the org a score out of 100 and a grade (A ≥ 90, B ≥ 75, C ≥ 60, D ≥ 40, F below). It starts at 100, and each finding costs points by severity: up to 14 for high, 7 for medium and 3 for low. A finding costs half its weight when it affects only a sliver of the data and the full weight when it affects 20% or more of the relevant records or fields.
+
+The score is deliberately simple, so you can explain it to a steering group and watch it move as you clean up. It measures data hygiene, not business health.
+
+## What's been built
+
+If the export includes metadata (`--metadata`), the report also counts what exists in the org: Apex classes, triggers and lines of Apex, Flows, layouts, reports, dashboards, permission sets, profiles and more. It's a quick measure of how much there is to migrate or maintain.
+
 ## Findings
 
 | Finding | Severity | Why it matters |
@@ -21,10 +31,12 @@
 | Email addresses on more than one Contact/Lead | high | Duplicates move with you in a migration, and cost money in marketing tools that bill per contact |
 | Custom fields never filled in | high | Usually safe to delete. Fewer fields means simpler layouts, reports and migrations |
 | Records owned by deactivated users | medium | Nobody is responsible for them, so reassign before migrating |
+| Open leads that already exist as a contact | medium | Unconverted leads sharing an email with a contact: the same person is being worked twice |
 | Company names on more than one Account | medium | Matched ignoring case, punctuation and suffixes such as Inc, Ltd and LLC |
 | Custom fields filled on fewer than 5% of records | medium | Often abandoned, or living on the wrong object |
 | Custom checkboxes never ticked | medium | Every record still has the default value |
 | Custom objects with no records | medium | Built but never used |
+| Custom fields that always hold the same value | low | Filled in on most records but identical everywhere, so they carry no information |
 | Picklist values nobody uses | low | Shorter picklists make data entry faster and cleaner |
 | Custom objects unchanged for over a year | low | Possibly abandoned, so check before migrating |
 | Contacts not linked to an account | low | Private contacts are invisible to most users |
@@ -36,4 +48,5 @@ Fields aren't judged on objects with fewer than 20 records, and formula fields a
 
 - Run it on a fresh export: `sf-exit export --org prod --audit`.
 - Use `--redact-pii` on the export if you want to share the report outside your team. Duplicate detection still works on hashed emails.
-- Schedule it alongside your backups and diff `audit.json` over time to see whether data quality is improving.
+- Schedule it alongside your backups and track `summary.score` in `audit.json` over time to see whether data quality is improving.
+- Large exports are analysed on all CPU cores, so the audit takes about as long as reading the CSVs once.

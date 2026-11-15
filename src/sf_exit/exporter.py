@@ -452,7 +452,7 @@ class Exporter:
         self.progress.finish(key, "done", ("0 rows " if changed == 0 else "") + detail)
         return ObjectResult(
             plan.name, "done", rows=rows, engine=engine,
-            file=str(dest.relative_to(self.out)), sha256=file_sha256(dest),
+            file=dest.relative_to(self.out).as_posix(), sha256=file_sha256(dest),
             seconds=(dt.datetime.now() - t0).total_seconds(), changed=changed,
             redacted=redacted,
         )
@@ -583,7 +583,7 @@ class Exporter:
                 tmp.replace(dest)
             self.progress.finish(key, "done", f"{rows:,} row{'' if rows == 1 else 's'} via rest")
             r = ObjectResult("ContentDocumentLink", "done", rows=rows, engine="rest",
-                             file=str(dest.relative_to(self.out)), sha256=file_sha256(dest),
+                             file=dest.relative_to(self.out).as_posix(), sha256=file_sha256(dest),
                              seconds=(dt.datetime.now() - t0).total_seconds())
         self.result.objects["ContentDocumentLink"] = r
         self.state.put(r)
@@ -686,7 +686,7 @@ class Exporter:
             folder.mkdir(parents=True, exist_ok=True)
             dest = folder / job["rel"]
             row = dict(kind=job["kind"], record_id=job["id"], parent_id=job["parent"],
-                       name=job["name"], path=str(dest.relative_to(self.out)), bytes=0,
+                       name=job["name"], path=dest.relative_to(self.out).as_posix(), bytes=0,
                        sha256="", md5="", sf_checksum=job["checksum"], status="ok", error="")
             try:
                 expected = int(job["size"]) if job.get("size") not in (None, "") else None

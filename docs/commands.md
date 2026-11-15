@@ -1,6 +1,6 @@
 # Command reference
 
-Every command has `--help` with all options. Commands that talk to Salesforce accept the [login options](authentication.md). The others (`audit`, `sql`, `diff`, `load`, `verify` without `--live`) work offline on an export folder.
+Every command has `--help` with all options. Commands that talk to Salesforce accept the [login options](authentication.md). The others work offline on an export folder.
 
 | Command | Talks to Salesforce | What it does |
 |---|:---:|---|
@@ -8,7 +8,10 @@ Every command has `--help` with all options. Commands that talk to Salesforce ac
 | [`metadata`](#metadata) | ✅ | Configuration only: Apex, Flows, objects, layouts, reports… |
 | [`plan`](#plan) | ✅ | Dry run: sizes, row counts, API calls needed |
 | [`doctor`](#doctor) | ✅ | Checks your permissions and limits |
-| [`audit`](#audit) | – | HTML data dictionary + org health findings |
+| [`restore`](#restore) | ✅ writes | Re-create records in a sandbox or another org, relationships intact |
+| [`browse`](#browse) | – | Click through the exported org in your browser |
+| [`mcp`](#mcp) | – | MCP server so AI assistants can query the export |
+| [`audit`](#audit) | – | Health score, findings and a searchable data dictionary |
 | [`sql`](#sql) | – | Query an export with SQL immediately |
 | [`diff`](#diff) | – | What changed between two exports |
 | [`load`](#load) | – | Load into SQLite, DuckDB, Postgres or Parquet |
@@ -69,6 +72,39 @@ Read-only. It lists the largest objects, file counts and sizes, and estimates th
 
 This checks API access, **View All Data**, **Query All Files** and your remaining daily API and Bulk limits. Without the two permissions, Salesforce silently returns only what your user can see.
 
+## restore
+
+```bash
+sf-exit restore ./prod-export --org my-sandbox -i Account -i Contact -i Opportunity             # plan
+sf-exit restore ./prod-export --org my-sandbox -i Account -i Contact -i Opportunity --execute   # write
+```
+
+| Option | What it does |
+|---|---|
+| `-i, --include PATTERN` | Objects to restore (required, glob, repeatable) |
+| `-x, --exclude PATTERN` | Objects to leave out |
+| `--execute` | Create the records. Without it, only the plan is shown |
+| `--allow-production` | Permit a production org as the target |
+| `--allow-same-org` | Permit the org the export came from as the target |
+
+Parents are inserted before children, lookups are rewritten to the new Ids, and the Id map and errors are written to `restore/<org id>/`. Experimental: see [restore.md](restore.md) for exactly what it does and doesn't do.
+
+## browse
+
+```bash
+sf-exit browse ./prod-export
+```
+
+A local, read-only web app over the export: list views, record pages, related lists, files and full-text search. Options: `--port` (default 8484, `0` for any free port), `--no-open`, `--reindex`. See [browse.md](browse.md).
+
+## mcp
+
+```bash
+sf-exit mcp ./prod-export
+```
+
+A Model Context Protocol server over stdio with read-only tools (`list_objects`, `describe_object`, `query`, `search`, `get_record`, `audit_findings`). See [ai-assistants.md](ai-assistants.md) for client set-up.
+
 ## audit
 
 ```bash
@@ -76,7 +112,7 @@ sf-exit audit ./prod-export          # writes ./prod-export/audit/
 sf-exit audit ./prod-export --open   # and opens the report
 ```
 
-Offline, with no API calls. It writes `index.html` (an interactive report), `data-dictionary.csv`, `findings.md` and `audit.json`. See [audit.md](audit.md) for what each finding means.
+Offline, with no API calls, using every CPU core on large exports. It prints a health score and writes `index.html` (an interactive report), `data-dictionary.csv`, `findings.md` and `audit.json`. See [audit.md](audit.md) for what each finding means.
 
 ## sql
 

@@ -7,6 +7,8 @@ Writes:
   docs/tools.svg      sf-exit sql + incremental backup + diff
   docs/audit.png      the HTML audit report's findings (needs node + playwright)
   docs/dictionary.png the HTML audit report's data dictionary
+  docs/browse.png     sf-exit browse: a record page with related lists and files
+  docs/restore.svg    sf-exit restore: dry run, then --execute into a sandbox
 """
 
 from __future__ import annotations
@@ -39,6 +41,23 @@ LAST = ["Lovelace", "Hopper", "Turing", "Johnson", "Torvalds", "Hamilton", "Ritc
         "Thompson", "Perlman", "Berners-Lee", "Allen", "McCarthy", "Lamarr", "Dijkstra", "Wilson"]
 
 
+OBJECT_LABELS = {"Invoice__c": "Invoice", "FAQ__kav": "FAQ", "SomeSetting__mdt": "Billing Setting",
+                 "ContentDocumentLink": "Content Document Link", "ContentDocument": "File",
+                 "ContentVersion": "File Version", "EmptyThing__c": "Legacy Import"}
+FIELD_LABELS = {"AccountId": "Account", "OwnerId": "Owner", "ParentId": "Parent", "CreatedById": "Created By",
+                "StageName": "Stage", "IsDeleted": "Deleted", "IsClosed": "Closed", "WhatId": "Related To",
+                "HasOptedOutOfEmail": "Email Opt Out", "NumberOfEmployees": "Employees",
+                "Account__c": "Account", "Id": "Record ID", "LinkedEntityId": "Linked To",
+                "ContentDocumentId": "File", "IsConverted": "Converted", "IsActive": "Active"}
+
+
+def _humanise(name: str) -> str:
+    import re
+
+    base = name[:-3] if name.endswith("__c") else name
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", base.replace("_", " ")).strip()
+
+
 def demo_org():
     rnd = random.Random(42)
     org = build_org(scale=420)  # ~10k Accounts, ~17k Contacts: big enough to use the Bulk API
@@ -62,6 +81,19 @@ def demo_org():
     contacts = org.objects["Contact"]["records"]
     for i in range(150):  # the same people entered twice, as in every real CRM
         contacts[8000 + i]["Email"] = contacts[i]["Email"]
+    for c in contacts:
+        c["Name"] = f"{c['FirstName']} {c['LastName']}"
+    org.objects["Contact"]["describe"]["fields"].insert(1, F("Name", nameField=True, createable=False))
+    for i, u in enumerate(org.objects["User"]["records"]):
+        u["Name"] = f"{FIRST[i * 3 % len(FIRST)]} {LAST[i * 5 % len(LAST)]}"
+    first = org.objects["Account"]["records"][0]
+    first.update(Description="Strategic account. Renewal due in Q3; expansion into APAC under discussion.",
+                 Region__c="EMEA", Churn_Risk__c="Low")
+    for name, obj in org.objects.items():
+        obj["describe"]["label"] = OBJECT_LABELS.get(name, obj["describe"]["label"])
+        for f in obj["describe"]["fields"]:
+            if f["label"] == f["name"]:
+                f["label"] = FIELD_LABELS.get(f["name"]) or _humanise(f["name"])
     METADATA_TYPES.pop("BrokenType", None)
     for i in range(48):
         METADATA_TYPES["ApexClass"][f"Service{i}"] = {f"classes/Service{i}.cls": "public class X {}"}
@@ -139,6 +171,22 @@ def main() -> None:
         (ROOT / "docs" / "tools.svg").write_text(console.export_svg(title="sf-exit sql · backup · diff"),
                                                  "utf-8")
         _screenshot(tmp / "acme-monday" / "audit" / "index.html", ROOT / "docs" / "audit.png")
+        _browse_shots(tmp / "acme-monday", ROOT / "docs")
+
+        sandbox = demo_org()
+        for name in ("Account", "Contact", "Opportunity", "Invoice__c", "Task", "Lead", "FAQ__kav"):
+            sandbox.objects[name]["records"].clear()
+        sandbox.objects["Organization"]["records"][0].update(
+            Id="00D000000000002AAA", Name="Acme UAT", IsSandbox=True)
+        cli_mod.make_client = lambda kw: (kw.clear(), client_for(sandbox))[1]
+        console = cli_mod.console = cli_mod.stdout = _console()
+        args = ["restore", "./acme", "-i", "Account", "-i", "Contact", "-i", "Opportunity",
+                "-i", "Invoice__c"]
+        shown = "restore ./acme --org uat-sandbox -i Account -i Contact -i Opportunity -i Invoice__c"
+        run(console, runner, args, shown)
+        console.print()
+        run(console, runner, args + ["--execute"], shown + " --execute")
+        (ROOT / "docs" / "restore.svg").write_text(console.export_svg(title="sf-exit restore"), "utf-8")
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -154,13 +202,14 @@ const {{chromium}} = require('playwright');
   await p.goto('file://{html}');
   await p.click('details.finding.high >> nth=1');
   await p.waitForTimeout(200);
-  const dictY = await p.evaluate(() => document.querySelectorAll('h2')[1].getBoundingClientRect().top + window.scrollY);
+  const dictTop = () => [...document.querySelectorAll('h2')].find(h => h.textContent === 'Data dictionary').getBoundingClientRect().top + window.scrollY;
+  const dictY = await p.evaluate(dictTop);
   await p.screenshot({{path: '{dest}', clip: {{x: 0, y: 0, width: 1200, height: dictY - 10}}, fullPage: true}});
   await p.click('details.finding.high >> nth=1 >> summary');
   await p.click('#objs th[data-k=name]');
   await p.click('tr.obj[data-n=Account]');
   await p.waitForTimeout(200);
-  const y = await p.evaluate(() => document.querySelectorAll('h2')[1].getBoundingClientRect().top + window.scrollY);
+  const y = await p.evaluate(dictTop);
   await p.screenshot({{path: '{dictionary}', clip: {{x: 0, y: y - 16, width: 1200, height: 820}}, fullPage: true}});
   await b.close();
 }})();"""
@@ -168,6 +217,35 @@ const {{chromium}} = require('playwright');
         subprocess.run(["node", "-e", script], check=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"skipped audit screenshot: {exc}")
+
+
+def _browse_shots(export_dir: Path, docs: Path) -> None:
+    from sf_exit.browse import BrowseServer
+    from sf_exit.index import ensure_index
+
+    ensure_index(export_dir)
+    server = BrowseServer(export_dir, 0)
+    server.serve_in_thread()
+    script = f"""
+const {{chromium}} = require('playwright');
+(async () => {{
+  const b = await chromium.launch();
+  const p = await b.newPage({{viewport: {{width: 1280, height: 860}}, deviceScaleFactor: 2}});
+  await p.goto('{server.url}#/r/001000000000001AAA');
+  await p.waitForSelector('#rel table');
+  await p.screenshot({{path: '{docs / "browse.png"}'}});
+  await p.goto('{server.url}#/s/northwind');
+  await p.waitForSelector('.hit');
+  await p.screenshot({{path: '{docs / "browse-search.png"}', clip: {{x: 0, y: 0, width: 1280, height: 560}}}});
+  await b.close();
+}})();"""
+    try:
+        subprocess.run(["node", "-e", script], check=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"skipped browse screenshots: {exc}")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

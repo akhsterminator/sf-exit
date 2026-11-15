@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import sys
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 # Fields that change without anyone editing the record.
 NOISE = {"LastViewedDate", "LastReferencedDate", "SystemModstamp"}
+PARALLEL_THRESHOLD_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -123,4 +126,17 @@ def diff_exports(old_dir: Path, new_dir: Path, details_dir: Optional[Path] = Non
     names = sorted(set(old_files) | set(new_files), key=str.lower)
     if only:
         names = [n for n in names if n in only]
-    return [diff_object(old_files.get(n), new_files.get(n), n, details_dir) for n in names]
+    jobs = [(old_files.get(n), new_files.get(n), n, details_dir) for n in names]
+    size = sum(p.stat().st_size for p in list(old_files.values()) + list(new_files.values()))
+    workers = min(os.cpu_count() or 1, 8, len(jobs))
+    if workers > 1 and size > PARALLEL_THRESHOLD_BYTES:  # big exports: one object per core
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                return list(pool.map(_diff_job, jobs))
+        except (OSError, RuntimeError, ImportError):
+            pass
+    return [_diff_job(j) for j in jobs]
+
+
+def _diff_job(job: Tuple[Optional[Path], Optional[Path], str, Optional[Path]]) -> ObjectDiff:
+    return diff_object(*job)

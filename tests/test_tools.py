@@ -128,3 +128,49 @@ def test_cli_export_with_everything(monkeypatch, tmp_path):
     res = CliRunner().invoke(cli_mod.cli, args[:3] + ["--incremental", "--no-files"], obj={})
     assert res.exit_code == 0, res.output
     assert "Changed" in res.output
+
+
+def test_audit_score_new_findings_and_configuration(tmp_path):
+    out = tmp_path / "exp"
+    Exporter(client_for(build_org()), ExportOptions(out_dir=out, poll_interval=0, files=False,
+                                                    metadata=True)).run()
+    report = run_audit(out)
+    ids = {f["id"]: f for f in report["findings"]}
+    # leads 1 and 2 share an email with a contact; lead 3 does too but is converted
+    assert ids["leads-matching-contacts"]["count"] == 2
+    assert any(i.startswith("Opportunity.Source_System__c") for i in ids["single-value-fields"]["items"])
+    assert all(0 <= f["share"] <= 1 for f in report["findings"])
+    s = report["summary"]
+    assert 0 <= s["score"] < 90 and s["grade"] in "BCDF"
+    assert s["configuration"]["Apex classes"] == 1 and s["configuration"]["Lines of Apex"] == 1
+    assert s["configuration"]["Reports"] == 1 and "Flows" in s["configuration"]
+    assert f"Health score: {s['score']}/100" in (out / "audit" / "findings.md").read_text()
+
+
+def test_audit_parallel_matches_serial(export_dir, tmp_path, monkeypatch):
+    from sf_exit import audit as audit_mod
+
+    serial = run_audit(export_dir, tmp_path / "serial")
+    monkeypatch.setattr(audit_mod, "PARALLEL_THRESHOLD_BYTES", 0)
+    parallel = run_audit(export_dir, tmp_path / "parallel")
+    assert parallel["findings"] == serial["findings"]
+    assert parallel["objects"] == serial["objects"]
+
+
+def test_health_score_bounds():
+    from sf_exit.audit import Finding, health_score
+
+    assert health_score([]) == (100, "A")
+    assert health_score([Finding("x", "high", "t", "d", share=1.0)] * 10) == (0, "F")
+    assert health_score([Finding("x", "low", "t", "d", share=0.0)]) == (98, "A")
+
+
+def test_diff_parallel_matches_serial(export_dir, tmp_path, monkeypatch):
+    from sf_exit import diff as diff_mod
+
+    new = tmp_path / "new"
+    shutil.copytree(export_dir, new)
+    (new / "data" / "Brand_New__c.csv").write_text('"Id"\n"a00000000000001AAA"\n')
+    serial = diff_exports(export_dir, new)
+    monkeypatch.setattr(diff_mod, "PARALLEL_THRESHOLD_BYTES", 0)
+    assert diff_exports(export_dir, new) == serial

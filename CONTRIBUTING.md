@@ -27,6 +27,10 @@ ruff check .      # lint
 | `src/sf_exit/audit.py` | The offline audit: findings, data dictionary and the HTML report template |
 | `src/sf_exit/diff.py` | Comparing two exports |
 | `src/sf_exit/sql.py` | DuckDB views over an export |
+| `src/sf_exit/index.py` | The local SQLite index (catalog, lookup indexes, full-text search) |
+| `src/sf_exit/browse.py` | The offline web app: JSON API, safe file serving and the single-page UI |
+| `src/sf_exit/mcp.py` | The MCP server and its read-only tools |
+| `src/sf_exit/restore.py` | Restore planning, Id remapping and the two-pass insert |
 | `src/sf_exit/cli.py` | Click commands and Rich output |
 | `tests/fake_org.py` | A fake org that speaks enough of the Salesforce API (REST, Bulk 2.0, composite, Metadata SOAP) to test everything |
 | `scripts/record_demo.py` | Regenerates the README's demo SVGs and screenshots |

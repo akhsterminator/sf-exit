@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sf-exit"
 dynamic = ["version"]
-description = "Export, audit and back up a Salesforce org: every record, file and piece of metadata, loaded into DuckDB, Postgres, SQLite or Parquet."
+description = "Export, audit, browse, back up and restore a Salesforce org: every record, file and piece of metadata, in open formats you own."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -15,6 +15,7 @@ keywords = [
   "salesforce", "export", "backup", "migration", "data-migration", "bulk-api",
   "crm", "etl", "duckdb", "sqlite", "postgres", "parquet", "data-portability",
   "metadata-api", "data-dictionary", "audit", "salesforce-backup", "incremental-backup",
+  "mcp", "model-context-protocol", "restore", "sandbox-seeding",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",

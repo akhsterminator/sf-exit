@@ -192,7 +192,8 @@ def cli(ctx, verbose):
       sf org login web --alias my-org            # log in once with the Salesforce CLI
       sf-exit plan   --org my-org                # what will be exported (read-only)
       sf-exit export --org my-org -d ./export    # records + files (+ --metadata)
-      sf-exit audit  ./export                    # data dictionary + org health report
+      sf-exit browse ./export                    # click through the org in your browser
+      sf-exit audit  ./export                    # data dictionary + org health score
       sf-exit sql    ./export "SELECT ..."       # query it instantly
       sf-exit load   ./export --to duckdb:///salesforce.duckdb
 
@@ -200,6 +201,11 @@ def cli(ctx, verbose):
     Backups:
       sf-exit export --org my-org -d ./backup --incremental   # only what changed
       sf-exit diff ./backup-monday ./backup-tuesday            # what changed between two
+      sf-exit restore ./backup --org sandbox -i Account -i Contact   # put records back
+
+    \b
+    AI assistants:
+      sf-exit mcp ./export                       # MCP server: ask questions of your CRM data
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
@@ -551,7 +557,9 @@ def audit(export_dir, out, open_report):
     for f in report["findings"][:12]:
         st = sev_style[f["severity"]]
         table.add_row(f"[{st}]●[/]", f"[{st}]{f['severity'].upper():<6}[/]", f["title"])
+    colour = "green" if s["score"] >= 75 else "yellow" if s["score"] >= 60 else "red"
     console.print(
+        f"Health score [bold {colour}]{s['score']}/100[/] (grade {s['grade']}) · "
         f"[bold]{s['records']:,}[/] records · [bold]{s['objects_with_data']:,}[/] objects with data · "
         f"[bold]{s['custom_fields']:,}[/] custom fields"
     )
@@ -740,6 +748,155 @@ def metadata_cmd(out_dir, types, exclude_types, **auth):
     if res.failed_types:
         console.print(f"[yellow]{len(res.failed_types)} type(s) could not be retrieved[/]: "
                       + ", ".join(sorted(res.failed_types)) + " (see metadata/retrieve-warnings.txt)")
+
+
+# ------------------------------------------------------------------ browse
+def _build_index(export_dir: str, force: bool = False) -> None:
+    from sf_exit.index import ensure_index
+
+    with console.status("Preparing the local index (first run only)…") as status:
+        ensure_index(Path(export_dir), force=force, on_progress=lambda m: status.update(m))
+
+
+@cli.command()
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--port", default=8484, show_default=True, help="Port on 127.0.0.1 (0 = any free port).")
+@click.option("--no-open", is_flag=True, help="Don't open the browser automatically.")
+@click.option("--reindex", is_flag=True, help="Rebuild the local index even if it looks current.")
+@handle_errors
+def browse(export_dir, port, no_open, reindex):
+    """Click through an exported org in your browser: offline, read-only, searchable.
+
+    Record pages with lookups, related lists and attached files, like Salesforce itself, but
+    served from your disk. Nothing is sent anywhere, and Salesforce isn't contacted.
+    """
+    from sf_exit.browse import BrowseServer
+
+    _build_index(export_dir, reindex)
+    try:
+        server = BrowseServer(Path(export_dir), port)
+    except OSError as exc:
+        console.print(f"[bold red]Error:[/] can't listen on port {port} ({exc}). Try --port 0.")
+        sys.exit(2)
+    console.print(f"[bold green]Browsing[/] [bold]{export_dir}[/] at [bold cyan]{server.url}[/]"
+                  "  [dim](Ctrl-C to stop)[/]")
+    if not no_open:
+        import webbrowser
+
+        webbrowser.open(server.url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print()
+    finally:
+        server.server_close()
+
+
+# --------------------------------------------------------------------- mcp
+@cli.command("mcp")
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@handle_errors
+def mcp_cmd(export_dir):
+    """Run an MCP server so AI assistants can answer questions from an export.
+
+    Read-only tools over the local index: list_objects, describe_object, query (SQL), search,
+    get_record and audit_findings. Speaks MCP over stdio; add it to any MCP client:
+
+    \b
+      {"mcpServers": {"salesforce": {"command": "sf-exit", "args": ["mcp", "/path/to/export"]}}}
+    """
+    from sf_exit.mcp import serve
+
+    _build_index(export_dir)
+    serve(Path(export_dir))
+
+
+# ----------------------------------------------------------------- restore
+@cli.command()
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@auth_options
+@click.option("--include", "-i", multiple=True, metavar="PATTERN",
+              help="Objects to restore (glob, repeatable): -i Account -i Contact -i '*__c'.")
+@click.option("--exclude", "-x", multiple=True, metavar="PATTERN", help="Objects to leave out.")
+@click.option("--execute", is_flag=True, help="Actually create records. Without it, only the plan is shown.")
+@click.option("--allow-production", is_flag=True, help="Permit restoring into a production org.")
+@click.option("--allow-same-org", is_flag=True, help="Permit restoring into the org the export came from.")
+@handle_errors
+def restore(export_dir, include, exclude, execute, allow_production, allow_same_org, **auth):
+    """Re-create records from an export in another org, with relationships intact. [experimental]
+
+    Parents are inserted before children, every lookup is rewritten to the new Ids, and
+    owners/record types are matched to the target org. Shows a plan by default; add --execute
+    to write. Refuses production orgs unless --allow-production.
+
+    \b
+      sf-exit restore ./export --org my-sandbox -i Account -i Contact -i Opportunity
+      sf-exit restore ./export --org my-sandbox -i Account -i Contact -i Opportunity --execute
+    """
+    from sf_exit.restore import RestoreError, Restorer
+
+    console.print(BANNER.format(v=__version__))
+    sf = make_client(auth)
+    _print_org(sf)
+    bar = RichProgressBar(TextColumn("  {task.description:<34}"), BarColumn(bar_width=28),
+                          TextColumn("{task.completed:,.0f}/{task.total:,.0f}"), console=console,
+                          transient=True)
+    tasks: Dict[str, TaskID] = {}
+
+    def on_progress(name: str, done: int, total: int) -> None:
+        if name not in tasks:
+            tasks[name] = bar.add_task(name, total=total or None)
+        bar.update(tasks[name], completed=done)
+
+    try:
+        with bar:
+            result = Restorer(sf, Path(export_dir), include, exclude, execute=execute,
+                              allow_production=allow_production, allow_same_org=allow_same_org,
+                              on_progress=on_progress).run()
+    except RestoreError as exc:
+        console.print(f"[bold red]Refused:[/] {exc}")
+        sys.exit(2)
+
+    table = Table(title="Restore order" if not execute else "Restored", title_justify="left")
+    cols = [("#", "right"), ("Object", "left"), ("Records", "right"), ("Fields", "right"),
+            ("Second-pass lookups", "left")]
+    if execute:
+        cols += [("Created", "right"), ("Failed", "right")]
+    for c, j in cols:
+        table.add_column(c, justify=j)
+    for i, p in enumerate(result.order, start=1):
+        row = [str(i), p.name, f"{p.rows:,}", str(len(p.fields)), ", ".join(p.deferred)]
+        if execute:
+            failed = result.failed.get(p.name, 0)
+            row += [f"[green]{result.created.get(p.name, 0):,}[/]", f"[red]{failed:,}[/]" if failed else ""]
+        table.add_row(*row)
+    stdout.print(table)
+    for name, why in sorted(result.not_restorable.items()):
+        console.print(f"  [dim]– {name}: {why}[/]")
+    if not result.order:
+        console.print("[yellow]Nothing to restore: no exported object matched --include.[/]")
+        sys.exit(1)
+    if not execute:
+        console.print("\n[bold]Dry run:[/] nothing was written. Add [bold]--execute[/] to create these records.")
+        return
+    unmapped = sum(result.unmapped_lookups.values())
+    console.print(
+        f"\n[bold green]Created {result.total_created:,} records[/]"
+        + (f", re-linked {sum(result.relinked.values()):,} in the second pass" if result.relinked else "")
+        + (f", skipped {sum(result.skipped_existing.values()):,} already restored" if result.skipped_existing else "")
+        + (f", [red]{result.total_failed:,} failed[/]" if result.total_failed else "") + "."
+    )
+    users = sum(result.unmatched_users.values())
+    if users:
+        console.print(f"[dim]{users:,} records had an owner with no matching active user in the target "
+                      "org, so they now belong to you.[/]")
+    if unmapped:
+        top = ", ".join(f"{k} ({v:,})" for k, v in sorted(result.unmapped_lookups.items(), key=lambda kv: -kv[1])[:5])
+        console.print(f"[yellow]{unmapped:,} lookups left empty[/] because the record they pointed to "
+                      f"isn't in the export: {top}")
+    console.print(f"Id map and errors: [bold]{result.out_dir}[/]")
+    if result.total_failed:
+        sys.exit(1)
 
 
 def main() -> None:

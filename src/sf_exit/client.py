@@ -136,10 +136,11 @@ class SalesforceClient:
         json_body: Any = None,
         headers: Optional[Dict[str, str]] = None,
         stream: bool = False,
+        retry: bool = True,
     ) -> requests.Response:
         url = self._url(path)
         refreshed = False
-        attempt = 0
+        attempt = 0 if retry else self.max_retries  # writes must not be replayed blindly
         while True:
             hdrs = {
                 "Authorization": f"Bearer {self.access_token}",

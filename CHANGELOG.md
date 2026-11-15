@@ -31,6 +31,12 @@ First public release.
 - `sf-exit sql`: query an export with DuckDB immediately, either as a one-off or interactively.
 - `--redact` and `--redact-pii`: consistent salted hashing of chosen or PII fields.
 - `--audit` and `--load` run the audit or a load straight after an export.
+- `sf-exit browse`: an offline, read-only web app over an export, with list views, record pages with lookups resolved, related lists, attached files and full-text search. Standard library only.
+- `sf-exit mcp`: a Model Context Protocol server with read-only tools, so AI assistants can query an export.
+- `sf-exit restore` (experimental): re-create records in a sandbox or another org in dependency order, with lookups remapped, a second pass for self-references, user and record-type matching, resume, and dry-run and production safeguards.
+- Audit: a 0–100 health score with a grade, findings for open leads that duplicate contacts and for custom fields that always hold one value, and an inventory of what's been built (Apex, Flows, reports…) when metadata is present.
+- Audit and diff use every CPU core on large exports.
+- File paths in `manifest.json` and `files/index.csv` always use forward slashes, so exports are portable between Windows, macOS and Linux.
 - Recipes: migrate to another CRM, free nightly backups, archive before shutdown, Postgres/DuckDB warehouse.
 
 [0.1.0]: https://github.com/akhsterminator/sf-exit/releases/tag/v0.1.0
