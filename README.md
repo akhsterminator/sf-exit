@@ -294,12 +294,6 @@ pytest
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The most valuable bug report is an object that fails in your org: paste the line from `REPORT.md`.
 
-## Star history
-
-If sf-exit saved you a migration project, a backup bill or a weekend, a ⭐ helps other people find it.
-
-[![Star History Chart](https://api.star-history.com/svg?repos=akhsterminator/sf-exit&type=Date)](https://star-history.com/#akhsterminator/sf-exit&Date)
-
 ## License
 
 [MIT](LICENSE). sf-exit is an independent open-source project and is not affiliated with, endorsed by or sponsored by Salesforce, Inc. Salesforce is a trademark of Salesforce, Inc.
