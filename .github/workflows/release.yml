@@ -2,9 +2,13 @@ name: Release
 
 # Runs when a release is published: in the GitHub UI (Releases → Draft a new release →
 # create tag "vX.Y.Z" → Generate release notes → Publish) or with `gh release create vX.Y.Z`.
+# Or push a version tag (git tag v1.2.3 && git push origin v1.2.3): the release-assets
+# job then creates the GitHub release itself, with notes taken from CHANGELOG.md.
 on:
   release:
     types: [published]
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -82,8 +86,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with: { name: dist, path: dist }
+      - name: Create the release when triggered by a tag push
+        if: github.event_name == 'push'
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            version="${GITHUB_REF_NAME#v}"
+            awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
