@@ -7,7 +7,7 @@ import pytest
 from sf_exit.exporter import Exporter, ExportOptions
 from sf_exit.restore import RestoreError, Restorer, plan_restore
 
-from .fake_org import build_org, client_for
+from .fake_org import F, build_org, client_for
 
 DATA_OBJECTS = ("Account", "Contact", "Opportunity", "Invoice__c", "Task", "FAQ__kav", "Lead")
 
@@ -144,3 +144,95 @@ def test_cli_restore_browse_index_and_mcp(export_dir, monkeypatch):
     assert res.exit_code == 0, res.output
     reply = next(line for line in res.stdout.splitlines() if line.startswith('{"jsonrpc"'))
     assert '\\"object\\": \\"Contact\\"' in reply
+
+
+def test_restore_files_are_uploaded_and_relinked(tmp_path):
+    out = tmp_path / "exp"
+    Exporter(client_for(build_org()), ExportOptions(out_dir=out, poll_interval=0)).run()
+    org = sandbox()
+    for name in ("ContentVersion", "ContentDocument", "ContentDocumentLink", "Attachment"):
+        org.objects[name]["records"].clear()
+    org.blobs.clear()
+    dry = Restorer(client_for(org), out, ["Account"], files=True).run()
+    assert dry.files_planned == 4 and org.writes == 0  # 3 documents on accounts + 1 attachment
+
+    result = Restorer(client_for(org), out, ["Account"], files=True, execute=True).run()
+    assert result.files_restored == 4 and result.files_failed == 0
+    new_ids = {old: new for old, new in
+               (line.split(",")[1:] for line in (result.out_dir / "id-map.csv").read_text().split()[1:])}
+    att = org.objects["Attachment"]["records"][0]
+    assert att["ParentId"] == new_ids["001000000000001AAA"] and att["Name"] == "logo.png"
+    assert org.blobs[f"Attachment/{att['Id']}"] == b"\x89PNG fake image bytes"
+    links = org.objects["ContentDocumentLink"]["records"]
+    assert {lk["LinkedEntityId"] for lk in links} <= set(new_ids.values())
+    # Contract 2 is linked to Account 1 and Account 4 in the export: one upload, two links
+    contract2 = next(v for v in org.objects["ContentVersion"]["records"] if v["Title"] == "Contract 2/final")
+    linked = {lk["LinkedEntityId"] for lk in links if lk["ContentDocumentId"] == contract2["ContentDocumentId"]}
+    assert linked == {new_ids["001000000000001AAA"], new_ids["001000000000004AAA"]}
+    assert result.links_created >= 1
+
+    again = Restorer(client_for(org), out, ["Account"], files=True, execute=True).run()
+    assert again.files_skipped == 4 and again.files_restored == 0  # resumable, no duplicates
+
+
+def test_upsert_makes_restore_idempotent(export_dir):
+    org = sandbox()
+    org.objects["Account"]["describe"]["fields"].append(F("Legacy_Id__c", externalId=True))
+    first = Restorer(client_for(org), export_dir, ["Account"], upsert=["Account.Legacy_Id__c"],
+                     execute=True).run()
+    assert first.created == {"Account": 24}
+    a1 = by(org, "Account")["Account 1"]
+    assert a1["Legacy_Id__c"] == "001000000000001AAA"  # the original Id, remembered
+    (first.out_dir / "id-map.csv").unlink()  # even without the id map...
+    second = Restorer(client_for(org), export_dir, ["Account"], upsert=["*.Legacy_Id__c"],
+                      execute=True).run()
+    assert second.updated == {"Account": 24} and second.created == {"Account": 0}
+    assert len(org.objects["Account"]["records"]) == 24  # ...no duplicates
+    by(org, "Account")["Account 1"]["Industry"] = "Changed in the sandbox"
+    third = Restorer(client_for(org), export_dir, ["Account"], upsert=["*.Legacy_Id__c"],
+                     execute=True).run()  # with the id map: brought up to date, not skipped
+    assert third.updated == {"Account": 24} and not third.skipped_existing
+    assert by(org, "Account")["Account 1"]["Industry"] != "Changed in the sandbox"
+    with pytest.raises(RestoreError, match="External ID"):
+        Restorer(client_for(org), export_dir, ["Contact"], upsert=["Contact.Nope__c"]).run()
+
+
+def test_same_org_restore_keeps_links_to_surviving_parents(export_dir):
+    org = build_org()  # the source org itself: contacts were deleted, accounts still exist
+    org.objects["Organization"]["records"][0]["IsSandbox"] = True
+    org.objects["Contact"]["records"].clear()
+    result = Restorer(client_for(org), export_dir, ["Contact"], allow_same_org=True,
+                      execute=True).run()
+    assert result.same_org and result.created == {"Contact": 40}
+    restored = org.objects["Contact"]["records"]
+    assert all(c["AccountId"].startswith("001") and not c["AccountId"].startswith("001N")
+               for c in restored)  # the original account Ids, not left empty
+    assert result.kept_lookups["Contact.AccountId"] == 40 and not result.unmapped_lookups
+
+
+def test_same_org_restore_brings_back_only_deleted_records(export_dir):
+    org = build_org()  # the source org itself, where two contacts have since been deleted
+    org.objects["Organization"]["records"][0]["IsSandbox"] = True
+    contacts = org.objects["Contact"]["records"]
+    gone = {contacts[3]["Id"], contacts[7]["Id"]}
+    contacts[:] = [c for c in contacts if c["Id"] not in gone]
+    plan = Restorer(client_for(org), export_dir, ["Contact"], allow_same_org=True).run()
+    assert plan.still_present == {"Contact": 38} and len(contacts) == 38  # dry run: no writes
+    result = Restorer(client_for(org), export_dir, ["Contact"], allow_same_org=True,
+                      execute=True).run()
+    assert result.created == {"Contact": 2} and result.still_present == {"Contact": 38}
+    assert len(contacts) == 40  # no duplicates of the 38 that were never deleted
+    again = Restorer(client_for(org), export_dir, ["Contact"], allow_same_org=True,
+                     execute=True).run()
+    assert sum(again.created.values()) == 0  # the two are in the Id map now
+
+
+def test_unknown_outcome_stops_and_is_never_duplicated(export_dir):
+    org = sandbox()
+    org.drop_connection["/composite/sobjects"] = 1  # the first insert batch times out
+    with pytest.raises(RestoreError, match="may or may not"):
+        Restorer(client_for(org), export_dir, ["Account"], execute=True).run()
+    unknown = (export_dir / "restore" / "00D000000000002AAA" / "unknown.csv").read_text()
+    assert unknown.count("\n") == 25  # header + the 24 accounts of that batch
+    again = Restorer(client_for(org), export_dir, ["Account"], execute=True).run()
+    assert again.skipped_unknown == {"Account": 24} and again.created == {"Account": 0}

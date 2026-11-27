@@ -1,8 +1,9 @@
 """``sf-exit browse``: click through an exported org in your browser, offline and read-only.
 
-A tiny local web app (standard library only) over the SQLite index: object lists, record
-pages with lookups resolved, related lists, attached files and full-text search. It binds
-to 127.0.0.1, opens the index read-only and never talks to Salesforce.
+A tiny local web app (standard library only) over the SQLite index: a dashboard, object
+lists, record pages with lookups resolved, related lists, attached files, each record's
+history across backups, and full-text search. It binds to 127.0.0.1, opens the index
+read-only and never talks to Salesforce.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from sf_exit import __version__
-from sf_exit.index import Catalog, Obj, connect, search
+from sf_exit import history as hist
+from sf_exit.index import Catalog, Obj, connect, index_path, search
 from sf_exit.schema import quote_ident as q
 
 PAGE = 50
@@ -86,6 +88,7 @@ def summary(con: sqlite3.Connection, cat: Catalog, export_dir: Path) -> Dict[str
         "records": sum(o.rows for o in objs),
         "files": files,
         "has_audit": (export_dir / "audit" / "index.html").exists(),
+        "has_history": bool(hist.runs(export_dir)),
         "objects": [{"name": o.name, "label": o.label, "rows": o.rows, "custom": o.custom}
                     for o in objs],
     }
@@ -168,20 +171,112 @@ def record_files(con: sqlite3.Connection, cat: Catalog, name: str, rid: str) -> 
             for r in rows]
 
 
+def dashboard(con: sqlite3.Connection, cat: Catalog, export_dir: Path) -> Dict[str, Any]:
+    """Charts for the home page: record growth, pipeline, files and backup history."""
+    top = [o for o in sorted(cat.objects.values(), key=lambda o: -o.rows)
+           if o.rows and "CreatedDate" in o.fields][:6]
+    months: Dict[str, Dict[str, int]] = {}
+    latest = ""
+    for o in top:
+        r = con.execute(f"SELECT max({q('CreatedDate')}) FROM {q(o.name)}").fetchone()
+        latest = max(latest, (r[0] or "")[:7])
+    if latest:
+        y, m = int(latest[:4]), int(latest[5:7])
+        keys = []
+        for _ in range(24):
+            keys.append(f"{y:04d}-{m:02d}")
+            y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+        keys.reverse()
+        for k in keys:
+            months[k] = {}
+        for o in top:
+            for month, n in con.execute(
+                    f"SELECT substr({q('CreatedDate')}, 1, 7) AS mo, count(*) FROM {q(o.name)} "
+                    f"WHERE {q('CreatedDate')} >= ? GROUP BY mo", (keys[0],)):
+                if month in months:
+                    months[month][o.label] = n
+    pipeline = []
+    opp = cat.objects.get("Opportunity")
+    if opp and opp.rows and {"StageName", "IsClosed"} <= set(opp.fields):
+        amount = q("Amount") if "Amount" in opp.fields else "0"
+        pipeline = [{"stage": r[0] or "(none)", "count": r[1], "amount": r[2] or 0} for r in con.execute(
+            f"SELECT {q('StageName')}, count(*), sum({amount}) FROM {q('Opportunity')} "
+            f"WHERE {q('IsClosed')} = 0 GROUP BY 1 ORDER BY 3 DESC, 2 DESC LIMIT 12")]
+    files = []
+    if cat.has_files:
+        files = [{"kind": r[0], "count": r[1], "bytes": r[2] or 0} for r in con.execute(
+            "SELECT kind, count(*), sum(bytes) FROM _files WHERE status LIKE 'ok%' GROUP BY 1 ORDER BY 3 DESC")]
+    return {"series": [o.label for o in top], "months": months, "pipeline": pipeline,
+            "files": files, "runs": changes(export_dir)}
+
+
+def changes(export_dir: Path) -> List[Dict[str, Any]]:
+    return [{"stamp": r.stamp, "at": r.finished_at, "kind": r.kind, "objects": r.objects,
+             "total": sum(r.objects.values())} for r in reversed(hist.runs(export_dir))]
+
+
+def changed_in_run(con: sqlite3.Connection, cat: Catalog, export_dir: Path, stamp: str,
+                   obj: str) -> Dict[str, Any]:
+    if not any(r.stamp == stamp for r in hist.runs(export_dir)):
+        raise NotFound(stamp)
+    if obj not in cat.objects:
+        raise NotFound(obj)
+    items = hist.changed_records(export_dir, stamp, obj)
+    titles = cat.titles(con, [i["id"] for i in items])
+    for i in items:
+        i["title"] = titles.get(i["id"], {}).get("title") or i["id"]
+        i["exists"] = i["id"] in titles
+    return {"object": obj, "label": cat.objects[obj].label, "stamp": stamp, "records": items}
+
+
+def record_history(con: sqlite3.Connection, cat: Catalog, export_dir: Path, rid: str) -> Dict[str, Any]:
+    try:
+        h = hist.record_history(export_dir, rid)
+    except hist.HistoryError:
+        return {"versions": []}
+    o = cat.objects.get(h["object"])
+    flds = o.fields if o else {}
+    lookups = {k for k, f in flds.items() if f.type == "reference"}
+    titles = cat.titles(con, [x for v in h["versions"] for k, pair in v["fields"].items()
+                              if k in lookups for x in pair if x])
+    for v in h["versions"]:
+        rows = []
+        for k, (a, b) in sorted(v["fields"].items()):
+            item = {"name": k, "label": flds[k].label if k in flds else k,
+                    "type": flds[k].type if k in flds else "", "old": a, "new": b}
+            for side, value in (("old", a), ("new", b)):
+                if k in lookups and value in titles:  # show the owner's name, not 005…
+                    item[side], item[side + "_id"] = titles[value]["title"], value
+            rows.append(item)
+        v["fields"] = rows
+        v.pop("values", None)
+    h.pop("current", None)
+    return h
+
+
 # ------------------------------------------------------------------ HTTP server
 class BrowseServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, export_dir: Path, port: int = 8484):
+    def __init__(self, export_dir: Path, port: int = 8484, host: str = "127.0.0.1"):
         self.export_dir = Path(export_dir).resolve()
+        self.allowed_hosts = {"127.0.0.1", "localhost", host}
         with contextlib.closing(connect(self.export_dir)) as con:
             self.catalog = Catalog(con)
-        super().__init__(("127.0.0.1", port), _Handler)
+        self._dashboard: Optional[Tuple[int, Dict[str, Any]]] = None
+        super().__init__((host, port), _Handler)
+
+    def dashboard(self, con: sqlite3.Connection) -> Dict[str, Any]:
+        stamp = index_path(self.export_dir).stat().st_mtime_ns
+        if not self._dashboard or self._dashboard[0] != stamp:  # big tables: compute once
+            self._dashboard = (stamp, dashboard(con, self.catalog, self.export_dir))
+        return self._dashboard[1]
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}/"
+        host = self.server_address[0]
+        return f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{self.server_address[1]}/"
 
     def serve_in_thread(self) -> threading.Thread:
         t = threading.Thread(target=self.serve_forever, daemon=True)
@@ -212,8 +307,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(payload, default=str).encode(), "application/json")
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
-        host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost"):  # blocks DNS-rebinding attacks
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in self.server.allowed_hosts:  # blocks DNS-rebinding attacks
             return self._json({"error": "forbidden host"}, 403)
         url = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -250,6 +345,15 @@ class _Handler(BaseHTTPRequestHandler):
                                qs.get("dir") == "desc", qs.get("q", ""), where)
         if route.startswith("record/"):
             return record(con, cat, route[7:])
+        if route == "dashboard":
+            return self.server.dashboard(con)
+        if route.startswith("history/"):
+            return record_history(con, cat, self.server.export_dir, route[8:])
+        if route == "changes":
+            return {"runs": changes(self.server.export_dir)}
+        if route.startswith("changes/") and route.count("/") == 2:
+            _, stamp, obj = route.split("/")
+            return changed_in_run(con, cat, self.server.export_dir, stamp, obj)
         raise NotFound(route)
 
     def _file(self, root: Path, rel: str, inline_html: bool = False) -> None:
@@ -314,10 +418,21 @@ button{padding:6px 12px;border:1px solid var(--line);border-radius:8px;backgroun
 .files a{display:inline-flex;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:7px 12px;margin:0 8px 8px 0}
 .hit{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:8px;display:block;color:inherit}.hit:hover{border-color:var(--accent);text-decoration:none}.hit b{color:var(--accent)}
 .yes{color:var(--ok);font-weight:700}
+.navl{display:block;padding:6px 10px;border-radius:7px;color:var(--side-ink);font-size:13px;font-weight:600}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:14px;margin:6px 0 10px}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}.chart h3{margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.chart svg{width:100%;height:auto;display:block}.chart svg text{fill:var(--muted);font-size:10px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;font-size:12px;color:var(--muted)}.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.hbar{display:grid;grid-template-columns:150px 1fr 110px;gap:8px;align-items:center;margin:5px 0;font-size:12.5px}.hbar .t{height:14px;background:var(--accent-bg);border-radius:4px;overflow:hidden}.hbar .t i{display:block;height:100%;background:var(--accent)}.hbar span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hbar b{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+.tl{border-left:2px solid var(--line);margin:6px 0 0 8px;padding-left:16px}.tl .ev{position:relative;margin:0 0 14px}.tl .ev:before{content:"";position:absolute;left:-23px;top:5px;width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.tl .ev.created:before{background:var(--ok)}.tl .ev.deleted:before{background:#dc2626}
+.badge{font-size:10.5px;font-weight:700;text-transform:uppercase;border-radius:999px;padding:1px 8px;color:#fff;background:var(--accent);margin-right:6px}.badge.created{background:var(--ok)}.badge.deleted{background:#dc2626}
+.chg{font-size:12.5px;margin-top:5px;table-layout:fixed}.chg td:first-child{width:24%}.chg td{white-space:normal;max-width:none;padding:5px 10px}.chg .old{color:#b91c1c;text-decoration:line-through}.chg .new{color:var(--ok)}.chg a{color:inherit}
 </style></head><body>
 <header><a class="brand" href="#/">sf<b>-</b>exit</a><span class="org" id="org"></span><span class="ro">read-only · offline</span>
 <form id="sf"><input id="sq" type="search" placeholder="Search every record…  (press /)" autocomplete="off"></form></header>
-<nav><input id="of" type="search" placeholder="Filter objects…"><div id="objs"></div></nav>
+<nav><a class="navl" href="#/">Home</a><a class="navl" id="navc" href="#/changes" hidden>Changes</a><a class="navl" id="nava" href="/audit/index.html" target="_blank" hidden>Audit report ↗</a>
+<input id="of" type="search" placeholder="Filter objects…" style="margin-top:8px"><div id="objs"></div></nav>
 <main id="main"></main>
 <script>
 const $=s=>document.querySelector(s),main=$("#main");let S=null;
@@ -345,10 +460,23 @@ function table(d,sortable,cur){const th=d.columns.map(c=>`<th data-c="${esc(c.na
 function pager(d,go){const a=d.offset+1,b=Math.min(d.offset+d.page,d.total);const el=document.createElement("div");el.className="bar";
  el.innerHTML=`<button ${d.offset?"":"disabled"} data-d="-1">← Prev</button><span class="muted">${d.total?num(a)+"–"+num(b):0} of ${num(d.total)}</span><button ${b<d.total?"":"disabled"} data-d="1">Next →</button>`;
  el.addEventListener("click",e=>{const x=e.target.dataset.d;if(x)go(d.offset+x*d.page)});return el}
-async function home(){document.title="sf-exit browse";const top=S.objects.filter(o=>o.rows).slice(0,24);
+const COLORS=["#2563eb","#16a34a","#d97706","#9333ea","#0891b2","#dc2626"];
+function columns(months,series){const keys=Object.keys(months);if(!keys.length||!series.length)return"";
+ const totals=keys.map(k=>series.reduce((a,s)=>a+(months[k][s]||0),0)),max=Math.max(1,...totals),W=640,H=190,P=26,bw=(W-P)/keys.length;
+ let g="";keys.forEach((k,i)=>{let y=H-16;series.forEach((s,j)=>{const v=months[k][s]||0;if(!v)return;const h=(H-30)*v/max;y-=h;g+=`<rect x="${P+i*bw+2}" y="${y}" width="${Math.max(1,bw-4)}" height="${h}" fill="${COLORS[j%6]}" rx="2"><title>${esc(k)} · ${esc(s)}: ${num(v)}</title></rect>`});
+  if(i%3===0)g+=`<text x="${P+i*bw+bw/2}" y="${H-3}" text-anchor="middle">${esc(k.slice(2))}</text>`});
+ g+=`<text x="0" y="12">${num(max)}</text><line x1="${P}" x2="${W}" y1="${H-16}" y2="${H-16}" stroke="currentColor" opacity=".15"/>`;
+ return`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Records created per month">${g}</svg><div class="legend">${series.map((s,j)=>`<span><i style="background:${COLORS[j%6]}"></i>${esc(s)}</span>`).join("")}</div>`}
+function hbars(items,label,value,fmtv){const max=Math.max(1,...items.map(value));return items.map(it=>`<div class="hbar"><span title="${esc(label(it))}">${esc(label(it))}</span><div class="t"><i style="width:${100*value(it)/max}%"></i></div><b>${fmtv(it)}</b></div>`).join("")}
+async function home(){document.title="sf-exit browse";const top=S.objects.filter(o=>o.rows).slice(0,8);
  main.innerHTML=`<h1>${esc(S.org.name||"Salesforce export")}</h1><div class="muted">${esc([S.org.edition,S.exported_at?"exported "+S.exported_at.slice(0,10):""].filter(Boolean).join(" · "))}</div>
- <div class="cards"><div class="card"><div class="v">${num(S.records)}</div><div class="k">records</div></div><div class="card"><div class="v">${S.objects.filter(o=>o.rows).length}</div><div class="k">objects with data</div></div>${S.files?`<div class="card"><div class="v">${num(S.files.count)}</div><div class="k">files · ${bytes(S.files.bytes)}</div></div>`:""}${S.has_audit?`<a class="card" href="/audit/index.html" target="_blank"><div class="v">Audit →</div><div class="k">health report &amp; data dictionary</div></a>`:""}</div>
- <h2>Largest objects</h2><div class="cards">${top.map(o=>`<a class="card" href="#/o/${enc(o.name)}"><div class="v">${num(o.rows)}</div><div class="k">${esc(o.label)}</div></a>`).join("")}</div>`}
+ <div class="cards"><div class="card"><div class="v">${num(S.records)}</div><div class="k">records</div></div><div class="card"><div class="v">${S.objects.filter(o=>o.rows).length}</div><div class="k">objects with data</div></div>${S.files?`<div class="card"><div class="v">${num(S.files.count)}</div><div class="k">files · ${bytes(S.files.bytes)}</div></div>`:""}${S.has_audit?`<a class="card" href="/audit/index.html" target="_blank"><div class="v">Audit →</div><div class="k">health score &amp; data dictionary</div></a>`:""}</div>
+ <div class="charts" id="charts"><div class="chart"><h3>Largest objects</h3>${hbars(top,o=>o.label,o=>o.rows,o=>num(o.rows))}</div></div>`;
+ const d=await api("dashboard");const c=$("#charts");if(!c)return;
+ if(Object.keys(d.months).length)c.insertAdjacentHTML("afterbegin",`<div class="chart"><h3>Records created per month</h3>${columns(d.months,d.series)}</div>`);
+ if(d.pipeline.length)c.insertAdjacentHTML("beforeend",`<div class="chart"><h3>Open pipeline by stage</h3>${hbars(d.pipeline,p=>p.stage,p=>Number(p.amount)||p.count,p=>(Number(p.amount)?Number(p.amount).toLocaleString(undefined,{notation:"compact",maximumFractionDigits:1})+" · ":"")+num(p.count))}</div>`);
+ if(d.files.length)c.insertAdjacentHTML("beforeend",`<div class="chart"><h3>Files</h3>${hbars(d.files,f=>f.kind,f=>f.bytes,f=>num(f.count)+" · "+bytes(f.bytes))}</div>`);
+ if(d.runs.length)c.insertAdjacentHTML("beforeend",`<div class="chart"><h3>Recent changes (backup history)</h3>${hbars(d.runs.slice(0,8),r=>r.at.replace("T"," ").slice(0,16),r=>r.total,r=>`<a href="#/changes">${num(r.total)}</a>`)}</div>`)}
 async function list(name,params){const cur={q:params.get("q")||"",sort:params.get("sort")||"",dir:params.get("dir")||"asc",offset:+(params.get("offset")||0)};
  const d=await api(`object/${enc(name)}?offset=${cur.offset}&q=${enc(cur.q)}&sort=${enc(cur.sort)}&dir=${cur.dir}`);document.title=d.label+" · sf-exit";
  const go=o=>{const p=new URLSearchParams();for(const[k,v]of Object.entries({...cur,...o}))if(v)p.set(k,v);location.hash=`#/o/${enc(name)}?${p}`};
@@ -365,15 +493,24 @@ async function rec(id){const d=await api("record/"+enc(id));document.title=d.tit
  $("#he").addEventListener("change",e=>{hideEmpty=e.target.checked;$("#fl").innerHTML=fields()});
  const show=async(i,offset=0)=>{const r=d.related[i];document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",+b.dataset.i===i));
   const l=await api(`object/${enc(r.object)}?field=${enc(r.field)}&id=${enc(id)}&offset=${offset}`);const box=$("#rel");box.innerHTML=table(l);if(l.total>l.page)box.appendChild(pager(l,o=>show(i,o)))};
- if(d.related.length){$("#tabs").addEventListener("click",e=>{if(e.target.dataset.i)show(+e.target.dataset.i)});show(0)}}
+ if(d.related.length){$("#tabs").addEventListener("click",e=>{if(e.target.dataset.i)show(+e.target.dataset.i)});show(0)}
+ const h=await api("history/"+enc(id));if(h.versions&&h.versions.length&&main.querySelector("h1"))main.insertAdjacentHTML("beforeend",`<h2>History (${h.versions.length})</h2>${timeline(h.versions)}<div class="muted">Recorded since ${esc((h.baseline||"").slice(0,10))} by sf-exit backups.</div>`)}
+function val(f,s){return f[s+"_id"]?`<a href="#/r/${enc(f[s+"_id"])}">${esc(f[s])}</a>`:fmt(f[s],f.type)}
+function timeline(vs){return`<div class="tl">${vs.slice().reverse().map(v=>`<div class="ev ${esc(v.change)}"><span class="badge ${esc(v.change)}">${esc(v.change)}</span><span class="muted">${esc(v.at.replace("T"," ").slice(0,16))}</span>${v.fields&&v.fields.length?`<table class="chg"><tbody>${v.fields.map(f=>`<tr><td>${esc(f.label)}</td><td class="old">${val(f,"old")}</td><td class="new">${val(f,"new")}</td></tr>`).join("")}</tbody></table>`:""}</div>`).join("")}</div>`}
+async function changesPage(){const d=await api("changes");document.title="Changes · sf-exit";
+ main.innerHTML=`<div class="crumb"><a href="#/">Home</a> / Changes</div><h1>What changed</h1><div class="muted" style="margin-bottom:12px">Every backup run into this folder records the records it saw created, changed or deleted.</div>`+(d.runs.length?d.runs.map(r=>`<div class="chart" style="margin-bottom:12px"><h3>${esc(r.at.replace("T"," ").slice(0,16))} · ${esc(r.kind)} · ${num(r.total)} records</h3>${hbars(Object.entries(r.objects).map(([o,n])=>({o,n})).sort((a,b)=>b.n-a.n),x=>(S.objects.find(o=>o.name===x.o)||{}).label||x.o,x=>x.n,x=>`<a href="#/changes/${enc(r.stamp)}/${enc(x.o)}">${num(x.n)}</a>`)}</div>`).join(""):'<p class="muted">No history yet: run the export again into the same folder (for example nightly with --incremental) and changes appear here.</p>')}
+async function changedPage(stamp,obj){const d=await api(`changes/${enc(stamp)}/${enc(obj)}`);document.title=d.label+" changes · sf-exit";
+ main.innerHTML=`<div class="crumb"><a href="#/">Home</a> / <a href="#/changes">Changes</a> / ${esc(d.label)}</div><h1>${esc(d.label)}: ${num(d.records.length)} changed</h1><table><thead><tr><th>Record</th><th>Change</th><th>Fields</th></tr></thead><tbody>${d.records.map(r=>`<tr><td>${r.exists?`<a href="#/r/${enc(r.id)}">${esc(r.title)}</a>`:esc(r.title)}</td><td><span class="badge ${esc(r.change)}">${esc(r.change)}</span></td><td class="muted">${esc(r.fields.join(", "))}</td></tr>`).join("")}</tbody></table>`}
 async function find(text){$("#sq").value=text;const d=await api("search?q="+enc(text));document.title=text+" · search";
  main.innerHTML=`<h1>Search: ${esc(text)}</h1><div class="muted" style="margin-bottom:14px">${d.results.length} result${d.results.length===1?"":"s"}${d.results.length>=40?" (showing the best 40)":""}</div>`+d.results.map(r=>`<a class="hit" href="#/r/${enc(r.id)}"><b>${esc(r.title)}</b> <span class="pill">${esc((S.objects.find(o=>o.name===r.object)||{}).label||r.object)}</span><div class="muted">${esc(r.extra)}</div></a>`).join("")}
 async function route(){const h=location.hash||"#/";mark();try{
+ if(h==="#/changes"){await changesPage();return}
+ if(h.startsWith("#/changes/")){const[st,ob]=h.slice(10).split("/").map(decodeURIComponent);await changedPage(st,ob);return}
  if(h.startsWith("#/o/")){const[p,qs]=h.slice(4).split("?");await list(decodeURIComponent(p),new URLSearchParams(qs||""))}
  else if(h.startsWith("#/r/"))await rec(decodeURIComponent(h.slice(4)));
  else if(h.startsWith("#/s/"))await find(decodeURIComponent(h.slice(4)));
  else await home();main.scrollTop=0}catch(e){main.innerHTML=`<h1>Not found</h1><p class="muted">${esc(e.message)}</p>`}}
-(async()=>{S=await api("summary");$("#org").textContent=[S.org.name,S.exported_at?"export of "+S.exported_at.slice(0,10):""].filter(Boolean).join(" · ");nav();
+(async()=>{S=await api("summary");$("#navc").hidden=!S.has_history;$("#nava").hidden=!S.has_audit;$("#org").textContent=[S.org.name,S.exported_at?"export of "+S.exported_at.slice(0,10):""].filter(Boolean).join(" · ");nav();
  $("#of").addEventListener("input",e=>nav(e.target.value));$("#sf").addEventListener("submit",e=>{e.preventDefault();const v=$("#sq").value.trim();if(v)location.hash="#/s/"+enc(v)});
  document.addEventListener("keydown",e=>{if(e.key==="/"&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();$("#sq").focus()}});
  window.addEventListener("hashchange",route);route()})();

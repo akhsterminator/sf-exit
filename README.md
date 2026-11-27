@@ -4,7 +4,7 @@
 
 ### Own your Salesforce data.
 
-The open-source toolkit to **export** everything in a Salesforce org, **browse** it offline, **audit** what's really in there, **back it up** every night and **restore** it, all in open formats on your own disk.
+The open-source toolkit to **export** everything in a Salesforce org, **browse** it offline, **audit** what's really in there, **back it up** every night with a full **history of every record**, and **restore** it, all in open formats on your own disk.
 
 [![CI](https://github.com/akhsterminator/sf-exit/actions/workflows/ci.yml/badge.svg)](https://github.com/akhsterminator/sf-exit/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/sf-exit?color=blue)](https://pypi.org/project/sf-exit/)
@@ -12,7 +12,7 @@ The open-source toolkit to **export** everything in a Salesforce org, **browse**
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/akhsterminator/sf-exit?style=social)](https://github.com/akhsterminator/sf-exit/stargazers)
 
-[Quick start](#quick-start) · [Browse](#browse-your-org-offline) · [Audit](#audit-whats-really-in-there) · [Backups](#nightly-backups-for-free) · [Restore](#restore-into-a-sandbox-or-a-new-org) · [AI](#ask-an-ai-about-your-crm) · [Commands](docs/commands.md) · [FAQ](#faq)
+[Quick start](#quick-start) · [Browse](#browse-your-org-offline) · [Audit](#audit-whats-really-in-there) · [Backups](#nightly-backups-for-free) · [Time machine](#a-time-machine-for-your-org) · [Restore](#restore-into-a-sandbox-or-a-new-org) · [AI](#ask-an-ai-about-your-crm) · [Commands](docs/commands.md) · [FAQ](#faq)
 
 <img src="docs/browse.png" alt="sf-exit browse: an exported Salesforce account with its fields, files and related lists, served offline" width="880">
 
@@ -25,7 +25,7 @@ The open-source toolkit to **export** everything in a Salesforce org, **browse**
 ## Quick start
 
 ```bash
-pipx install 'sf-exit[duckdb]'                # or: pip install / uvx sf-exit
+pipx install 'sf-exit[duckdb]'                # or: uvx sf-exit · or the no-Python binary (see Install)
 sf org login web --alias my-org               # log in once with the Salesforce CLI
 sf-exit export --org my-org -d ./export --metadata --audit
 sf-exit browse ./export                       # click through it in your browser
@@ -41,10 +41,11 @@ Want to look before you leap? `sf-exit plan --org my-org` estimates sizes and AP
 |---|---|
 | 📦 **Export everything** | Every object, record and field, plus files, attachments and the links between them. Bulk API 2.0 for big objects, batched REST for small ones. Resumable. [→](docs/commands.md#export) |
 | 🧬 **Export the configuration** | Apex, Flows, objects, layouts, reports, dashboards and permission sets as a deployable Metadata API folder. [→](docs/commands.md#metadata) |
-| 🖥️ **Browse it offline** | A local web app over your export: record pages, related lists, files and full-text search. Like Salesforce, minus the subscription. [→](docs/browse.md) |
+| 🖥️ **Browse it offline** | A local web app over your export: a dashboard, record pages, related lists, files and full-text search. Like Salesforce, minus the subscription. [→](docs/browse.md) |
 | 🩺 **Audit the org** | A health score, a searchable data dictionary and findings: unused fields, duplicates, stale pipeline, orphaned records. [→](docs/audit.md) |
 | 🔁 **Back up incrementally** | Nightly runs fetch only what changed or was deleted. `sf-exit diff` shows exactly what changed, field by field. [→](docs/recipes/nightly-backups.md) |
-| ♻️ **Restore** | Re-create records in a sandbox or a new org, parents first, with every lookup remapped. [→](docs/restore.md) |
+| ⏪ **Time machine** | Every backup records what changed. See any record's full history, or rebuild the whole org as it was at any moment, with no extra API calls. [→](docs/time-machine.md) |
+| ♻️ **Restore** | Re-create records and files in a sandbox or a new org, parents first, with every lookup remapped. Upsert by external Id for safe re-runs. [→](docs/restore.md) |
 | 🤖 **Ask an AI** | A built-in MCP server gives AI assistants read-only SQL, search and record tools over your export. [→](docs/ai-assistants.md) |
 | 🔎 **Query it instantly** | `sf-exit sql ./export "SELECT …"`: typed SQL with no load step. [→](docs/commands.md#sql) |
 | 🚚 **Load it anywhere** | DuckDB, Postgres, SQLite or Parquet with real column types, generated DDL and an ER diagram. [→](docs/commands.md#load) |
@@ -56,15 +57,15 @@ Want to look before you leap? `sf-exit plan --org my-org` estimates sizes and AP
 
 ## Browse your org offline
 
-Cancelled the licences but legal still asks "what did that account look like"? `sf-exit browse` serves the export as a local, read-only web app: every object, sortable list views, record pages with lookups you can click, related lists, attached files and search across every record.
+Cancelled the licences but legal still asks "what did that account look like"? `sf-exit browse` serves the export as a local, read-only web app: a dashboard, every object, sortable list views, record pages with lookups you can click, related lists, attached files, each record's history and search across every record.
 
 ```bash
 sf-exit browse ./export
 ```
 
-<p align="center"><img src="docs/browse-search.png" alt="Full-text search across every exported record" width="860"></p>
+<p align="center"><img src="docs/dashboard.png" alt="sf-exit browse dashboard: records created per month, largest objects, open pipeline by stage, files and backup history" width="860"></p>
 
-It uses only the Python standard library, listens on localhost, and opens its index read-only. [More →](docs/browse.md)
+It uses only the Python standard library, listens on localhost, and opens its index read-only. The charts are drawn locally too, with no JavaScript libraries and no network. [More →](docs/browse.md)
 
 ## Audit what's really in there
 
@@ -105,13 +106,26 @@ The complete GitHub Actions + S3 setup, with weekly full runs, point-in-time his
     SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
 ```
 
+## A time machine for your org
+
+Every backup run into the same folder records what changed and what it replaced. Within weeks you have something Salesforce doesn't give you: the history of **every field of every object**, for as long as you keep the folder. Field history tracking stops at 20 fields per object and 18–24 months.
+
+```bash
+sf-exit history  ./backup 0015g00000ABCDEAA4                          # who changed what, and when
+sf-exit snapshot ./backup --as-of 2026-11-20T09:00:00Z -o ./before    # the whole org, as it was then
+```
+
+<p align="center"><img src="docs/history.png" alt="A record's history in sf-exit browse: three nightly backups with old and new values for each changed field" width="760"></p>
+
+A snapshot is an ordinary export folder, so you can browse it, diff it against today, query it, or restore from it. Someone's import overwrote 3,000 contacts on Tuesday morning? Snapshot Monday night and `diff` it against today to see every field that changed, with the old values ready to load back. Records deleted since then come back with `sf-exit restore`. [More →](docs/time-machine.md)
+
 ## Restore into a sandbox or a new org
 
-A backup you can't restore is only an archive. `sf-exit restore` re-creates records in dependency order and rewrites every lookup to the new Ids, so accounts, contacts, opportunities and your custom objects arrive still connected. Use it to seed a sandbox with real data or to bring back what was deleted.
+A backup you can't restore is only an archive. `sf-exit restore` re-creates records in dependency order and rewrites every lookup to the new Ids, so accounts, contacts, opportunities and your custom objects arrive still connected. With `--files`, Salesforce Files and attachments come back too, linked to the right records. Use it to seed a sandbox with real data, or to bring back what was deleted: restoring into the source org re-creates only the records that no longer exist there.
 
 <p align="center"><img src="docs/restore.svg" alt="sf-exit restore: a dry run showing the insert order, then the real run" width="860"></p>
 
-It shows a plan unless you add `--execute`, refuses production orgs unless you pass `--allow-production`, and can resume without creating duplicates. It's marked experimental: try it on a sandbox first. [Exactly what it does and doesn't do →](docs/restore.md)
+It shows a plan unless you add `--execute`, refuses production orgs unless you pass `--allow-production`, and resumes without creating duplicates. `--upsert '*.Legacy_Id__c'` matches records on an external Id, so re-runs update instead of duplicating, and a write whose outcome is unknown after a network failure is never blindly repeated. It's marked experimental: try it on a sandbox first. [Exactly what it does and doesn't do →](docs/restore.md)
 
 ## Ask an AI about your CRM
 
@@ -121,7 +135,7 @@ It shows a plan unless you add `--execute`, refuses production orgs unless you p
 { "mcpServers": { "salesforce": { "command": "sf-exit", "args": ["mcp", "/path/to/export"] } } }
 ```
 
-Tools: `list_objects`, `describe_object`, `query` (read-only SQL), `search`, `get_record`, `audit_findings`. [Set-up and privacy notes →](docs/ai-assistants.md)
+Tools: `list_objects`, `describe_object`, `query` (read-only SQL), `search`, `get_record`, `get_record_history`, `audit_findings`. [Set-up and privacy notes →](docs/ai-assistants.md)
 
 ## What you get
 
@@ -136,8 +150,8 @@ export/
 │   └── index.csv                 file → record mapping
 ├── metadata/                 Apex, Flows, objects, layouts, reports… + package.xml   (--metadata)
 ├── audit/                    index.html, data-dictionary.csv, findings.md            (--audit)
-├── changes/<timestamp>/      rows changed in each incremental run                    (--incremental)
-├── restore/<org id>/         id-map.csv and errors.csv from each restore             (restore)
+├── changes/<run>/            what each backup run changed, and what it replaced      (time machine)
+├── restore/<org id>/         id-map.csv, errors.csv and files-map.csv per restore    (restore)
 ├── schema/Account.json       full describe: labels, picklists, relationships
 ├── schema.postgres.sql       ready-to-run DDL (also .duckdb.sql and .sqlite.sql)
 ├── erd.mmd                   Mermaid entity-relationship diagram
@@ -167,7 +181,8 @@ The format is documented in [docs/output-format.md](docs/output-format.md). It's
 | Configuration (Apex, Flows, layouts…)        | ✅ | ❌ | ❌ | some |
 | Run whenever you want                        | ✅ | ❌ weekly or monthly | ✅ | ✅ |
 | Incremental backups + diff between them      | ✅ | ❌ | ❌ | ✅ |
-| Restore with relationships remapped          | ✅ experimental | ❌ | manual | ✅ |
+| Every record's history, point-in-time copies | ✅ | ❌ | ❌ | ✅ |
+| Restore records + files, lookups remapped    | ✅ experimental | ❌ | manual | ✅ |
 | Browse the backup offline                    | ✅ | ❌ | ❌ | vendor portal |
 | Org audit & data dictionary                  | ✅ | ❌ | ❌ | rarely |
 | SQL, Postgres/DuckDB/Parquet, AI access      | ✅ | ❌ | ❌ | rarely |
@@ -178,11 +193,13 @@ The format is documented in [docs/output-format.md](docs/output-format.md). It's
 ## Built to be trusted
 
 - **Complete by default.** It finds every queryable object, including history, activities, Chatter, email, Knowledge and custom metadata, and every field. Objects Salesforce refuses to export unfiltered are handled (`ContentDocumentLink`, Knowledge `__kav`) or skipped with the reason written down.
-- **Gentle on API limits.** Schemas and small objects are fetched **25 per API call**; large objects use Bulk API 2.0 jobs that cost a handful of calls whatever their size. `sf-exit plan` shows the cost before you start.
+- **Gentle on API limits.** Schemas are described **25 objects per API call** and small objects are queried **5 per call** through the Composite API, which Salesforce bills as one call. Large objects use Bulk API 2.0 jobs that cost a handful of calls whatever their size. `sf-exit plan` shows the cost before you start.
 - **Resumable and verifiable.** Press Ctrl-C at any point and re-run to continue. Every CSV and file is SHA-256'd in `manifest.json`, file bodies are checked against Salesforce's own MD5, and `sf-exit verify --live` compares row counts with the org.
+- **Survives bad networks.** Connections that drop halfway through a Bulk results page or a file download are retried from where it's safe. One object that still fails is reported, and the rest of the export carries on. Writes are never blindly repeated.
+- **Exact.** Numbers are written exactly as Salesforce stores them, with no floating-point rounding, and profiles and permission sets come with their complete field and object permissions.
 - **Fast where it counts.** Parallel object exports and file downloads; audit and diff use every CPU core on large exports.
 - **Small and inspectable.** Three runtime dependencies. Browse, MCP, audit and diff are pure standard library.
-- **Tested end to end.** The suite runs against an in-process simulated Salesforce (REST, Bulk API 2.0, composite, sObject collections and the Metadata API) on Linux, macOS and Windows, Python 3.10–3.14, plus a real Postgres.
+- **Tested end to end.** The suite runs against an in-process simulated Salesforce (REST, Bulk API 2.0, composite, sObject collections, file uploads and the Metadata API), including injected failures such as dropped connections and missing permissions, on Linux, macOS and Windows, Python 3.10–3.14, plus a real Postgres. The standalone binaries are smoke-tested in CI too.
 
 ## How it works
 
@@ -191,9 +208,9 @@ flowchart LR
   A[describeGlobal] --> B[describe objects<br/>25 per call]
   B --> C{rows ≥ 10k?}
   C -- yes --> D[Bulk API 2.0 job<br/>stream CSV pages]
-  C -- no --> E[composite batch<br/>25 queries per call]
+  C -- no --> E[composite<br/>5 queries per call]
   D -. refused .-> E
-  D & E --> F[data/*.csv<br/>merge deltas if --incremental]
+  D & E --> F[data/*.csv<br/>merge deltas, record history]
   F --> G[ContentDocumentLink<br/>chunked by Id]
   G --> H[files<br/>parallel, MD5-verified]
   H --> M[Metadata API retrieve<br/>--metadata]
@@ -213,24 +230,30 @@ flowchart LR
 | Access token | `--instance-url … --access-token 00D…` | One-offs, other tools |
 | Username + password | `--client-id … -u … --password 'pw+token'` | Legacy setups |
 
-Every flag can also be set with an `SF_*` environment variable, for example `SF_ORG` or `SF_CLIENT_ID`. Add `--sandbox` for sandboxes. For a complete export, the user needs **View All Data** and **Query All Files**; `sf-exit doctor` checks.
+Every flag can also be set with an `SF_*` environment variable, for example `SF_ORG` or `SF_CLIENT_ID`. Add `--sandbox` for sandboxes. For a complete export, the user needs **View All Data** and **Query All Files** (plus **View Setup and Configuration** for up-front record counts); `sf-exit doctor` checks.
 
 ## Install
 
 ```bash
-pipx install sf-exit               # export, browse, audit, diff, restore, mcp, SQLite
+pipx install sf-exit               # export, browse, audit, diff, history, restore, mcp, SQLite
 pipx install 'sf-exit[duckdb]'     # + sf-exit sql, DuckDB and Parquet
 pipx install 'sf-exit[all]'        # + Postgres and JWT login
 docker run --rm -it -v "$PWD:/work" ghcr.io/akhsterminator/sf-exit --help
 ```
 
-Python 3.10+ on macOS, Linux and Windows.
+No Python? Install the single-file binary for Linux (x86_64, arm64), macOS (Apple silicon) or Windows:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akhsterminator/sf-exit/main/install.sh | sh
+```
+
+The script picks the right file from the [latest release](https://github.com/akhsterminator/sf-exit/releases/latest), checks it against `SHA256SUMS` and installs it to `~/.local/bin`. On Windows, download `sf-exit-windows-x86_64.exe` from the release. The binaries include DuckDB; Postgres loading needs the Python package. With Python, any of 3.10–3.14 on macOS, Linux and Windows works.
 
 ## FAQ
 
 <details><summary><b>Will this use up my API limits?</b></summary>
 
-Rarely by much. Small objects are fetched 25 per call, a Bulk API job costs a handful of calls however large it is, and each file costs one call. `sf-exit plan` shows the estimate against your remaining daily allowance before you start. Incremental backups usually take a few dozen calls plus one per new file.
+Rarely by much. Schemas come 25 per call and small objects 5 per call, a Bulk API job costs a handful of calls however large it is, and each file costs one call. `sf-exit plan` shows the estimate against your remaining daily allowance before you start. Incremental backups usually take a few dozen calls plus one per new file, and the history they build costs nothing extra.
 </details>
 
 <details><summary><b>Is it safe to run against production?</b></summary>
@@ -250,7 +273,12 @@ Incremental runs use `queryAll`, so records sent to the Recycle Bin since the la
 
 <details><summary><b>Does restore put files and metadata back too?</b></summary>
 
-Not yet. It restores records. Metadata goes back with `sf project deploy start --metadata-dir ./export/metadata` (do that first), and files with Data Loader or the API, using `files/index.csv` and the restore's `id-map.csv` to re-link them. See [docs/restore.md](docs/restore.md).
+Files, yes: `--files` uploads the newest version of each Salesforce File and every Attachment, and links them to the restored records. Metadata goes back with `sf project deploy start --metadata-dir ./export/metadata` (do that first). See [docs/restore.md](docs/restore.md).
+</details>
+
+<details><summary><b>Can I see what a record looked like last month?</b></summary>
+
+Yes, if you've been backing up into the same folder: `sf-exit history ./backup <record id>` shows every change with old and new values, and `sf-exit snapshot ./backup --as-of 2026-10-31 -o ./oct31` rebuilds the whole org as it was. In `sf-exit browse`, every record page has a History section. See [docs/time-machine.md](docs/time-machine.md).
 </details>
 
 <details><summary><b>Why are some objects skipped?</b></summary>
@@ -268,17 +296,18 @@ No. sf-exit talks only to your Salesforce instance and writes only to your disk.
 - [x] Records, files and attachments, resumable
 - [x] Metadata (Apex, Flows, layouts, reports…)
 - [x] Incremental backups and `diff`
+- [x] Time machine: every record's history and point-in-time snapshots
 - [x] Org audit, health score and data dictionary
-- [x] Offline browser
+- [x] Offline browser with a dashboard
 - [x] MCP server for AI assistants
-- [x] Restore records with remapped relationships (experimental)
+- [x] Restore records and files with remapped relationships, upsert by external Id (experimental)
 - [x] PII redaction
-- [ ] Restore: files, upsert by external Id, point-in-time from `changes/`
+- [x] Single-file binaries
+- [ ] Homebrew and Scoop packages
 - [ ] Write directly to S3 / GCS / Azure Blob
 - [ ] Import helpers for HubSpot, Attio and Twenty
 - [ ] Big object (`__b`) and Field Audit Trail export
-- [ ] Browse: saved views and charts
-- [ ] Single-file binaries (Homebrew, Scoop)
+- [ ] Browse: saved views
 
 Ideas and requests are welcome: [open an issue](https://github.com/akhsterminator/sf-exit/issues/new/choose) or start a [discussion](https://github.com/akhsterminator/sf-exit/discussions). Easy starting points are labelled [good first issue](https://github.com/akhsterminator/sf-exit/labels/good%20first%20issue).
 

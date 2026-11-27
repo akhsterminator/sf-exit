@@ -8,12 +8,16 @@ Writes:
   docs/audit.png      the HTML audit report's findings (needs node + playwright)
   docs/dictionary.png the HTML audit report's data dictionary
   docs/browse.png     sf-exit browse: a record page with related lists and files
+  docs/dashboard.png  sf-exit browse: the home page dashboard
+  docs/history.png    sf-exit browse: one record's history across a month of nightly backups
   docs/restore.svg    sf-exit restore: dry run, then --execute into a sandbox
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
+import json
 import os
 import random
 import shutil
@@ -29,7 +33,7 @@ from click.testing import CliRunner  # noqa: E402
 from rich.console import Console  # noqa: E402
 
 import sf_exit.cli as cli_mod  # noqa: E402
-from tests.fake_org import METADATA_TYPES, F, build_org, client_for  # noqa: E402
+from tests.fake_org import F, build_org, client_for  # noqa: E402
 
 COMPANIES = ["Northwind Traders", "Globex", "Initech", "Umbrella Health", "Stark Industries",
              "Wayne Logistics", "Hooli", "Vandelay Imports", "Soylent Foods", "Cyberdyne Systems",
@@ -88,21 +92,37 @@ def demo_org():
         u["Name"] = f"{FIRST[i * 3 % len(FIRST)]} {LAST[i * 5 % len(LAST)]}"
     first = org.objects["Account"]["records"][0]
     first.update(Description="Strategic account. Renewal due in Q3; expansion into APAC under discussion.",
-                 Region__c="EMEA", Churn_Risk__c="Low")
+                 Region__c="EMEA", Churn_Risk__c="Low", AnnualRevenue=332000.0, NumberOfEmployees=1200,
+                 OwnerId="005000000000002AAA")
+    # Two years of growth, so the dashboard has something to show.
+    start = dt.datetime(2024, 12, 1, tzinfo=dt.timezone.utc)
+    span = (dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc) - start).total_seconds()
+    for name in ("Account", "Contact", "Opportunity", "Lead", "Invoice__c", "Task"):
+        for r in org.objects[name]["records"]:
+            r["CreatedDate"] = _stamp(start + dt.timedelta(seconds=span * rnd.random() ** 0.62))
+    stages = ["Prospecting", "Qualification", "Needs Analysis", "Proposal", "Negotiation",
+              "Closed Won", "Closed Lost"]
+    for o in org.objects["Opportunity"]["records"]:
+        stage = rnd.choices(stages, [14, 12, 9, 8, 6, 30, 21])[0]
+        o.update(StageName=stage, IsClosed=stage.startswith("Closed"),
+                 Amount=float(max(500, round(rnd.lognormvariate(9.6, 0.8) / 500) * 500)))
+    for f in org.objects["Opportunity"]["describe"]["fields"]:
+        if f["name"] == "StageName":
+            f["picklistValues"] = [{"value": v, "active": True} for v in stages]
     for name, obj in org.objects.items():
         obj["describe"]["label"] = OBJECT_LABELS.get(name, obj["describe"]["label"])
         for f in obj["describe"]["fields"]:
             if f["label"] == f["name"]:
                 f["label"] = FIELD_LABELS.get(f["name"]) or _humanise(f["name"])
-    METADATA_TYPES.pop("BrokenType", None)
+    md = org.metadata
+    md.pop("BrokenType", None)
     for i in range(48):
-        METADATA_TYPES["ApexClass"][f"Service{i}"] = {f"classes/Service{i}.cls": "public class X {}"}
+        md["ApexClass"][f"Service{i}"] = {f"classes/Service{i}.cls": "public class X {}"}
     for i in range(14):
-        METADATA_TYPES["Flow"][f"Flow_{i}"] = {f"flows/Flow_{i}.flow-meta.xml": "<Flow/>"}
-    METADATA_TYPES["PermissionSet"] = {f"PS_{i}": {f"permissionsets/PS_{i}.permissionset": "<x/>"}
-                                       for i in range(9)}
-    METADATA_TYPES["ApexTrigger"] = {f"T{i}": {f"triggers/T{i}.trigger": "trigger T on Account (before insert) {}"}
-                                     for i in range(6)}
+        md["Flow"][f"Flow_{i}"] = {f"flows/Flow_{i}.flow-meta.xml": "<Flow/>"}
+    md["PermissionSet"] = {f"PS_{i}": {} for i in range(9)}
+    md["ApexTrigger"] = {f"T{i}": {f"triggers/T{i}.trigger": "trigger T on Account (before insert) {}"}
+                         for i in range(6)}
     _add_files(org, 240)
     return org
 
@@ -119,6 +139,88 @@ def _add_files(org, n: int) -> None:
                    "Checksum": hashlib.md5(data).hexdigest(), "SystemModstamp": "2024-06-01T00:00:00.000Z"})
         cd.append({"Id": did, "Title": f"Proposal {i}", "IsDeleted": False})
         org.blobs[f"ContentVersion/{vid}"] = data
+
+
+def _stamp(when: dt.datetime) -> str:
+    return when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def restamp(out: Path, finished: str) -> None:
+    """Pretend the last run into ``out`` finished at ``finished``: the demo's nightly runs
+    happen seconds apart, and history, the dashboard and the next watermark use these times."""
+    end = dt.datetime.fromisoformat(finished.replace("Z", "+00:00"))
+    began = (end - dt.timedelta(minutes=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m = json.loads((out / "manifest.json").read_text("utf-8"))
+    m["started_at"], m["finished_at"] = began, finished
+    for o in (m.get("objects") or {}).values():
+        if o.get("started_at"):
+            o["started_at"] = began
+    run = m["runs"][-1]
+    run["started_at"], run["finished_at"] = began, finished
+    if run.get("changes"):
+        meta = out / run["changes"] / "run.json"
+        d = json.loads(meta.read_text("utf-8"))
+        d["started_at"], d["finished_at"] = began, finished
+        meta.write_text(json.dumps(d, indent=1), "utf-8")
+    (out / "manifest.json").write_text(json.dumps(m, indent=1), "utf-8")
+
+
+def edit(record: dict, when: str, **values) -> None:
+    record.update(values, SystemModstamp=when, LastModifiedDate=when)
+
+
+def a_month_of_backups(org, runner) -> None:
+    """Three nightly runs' worth of edits, so history and the Changes page have a story."""
+    rnd = random.Random(3)
+    accounts = org.objects["Account"]["records"]
+    contacts = org.objects["Contact"]["records"]
+    opps = org.objects["Opportunity"]["records"]
+    northwind = accounts[0]
+    nights = {
+        "2026-11-03T22:00:00Z": "2026-11-03T15:12:00.000Z",
+        "2026-11-12T22:00:00Z": "2026-11-12T10:41:00.000Z",
+        "2026-11-23T22:00:00Z": "2026-11-23T16:05:00.000Z",
+    }
+    for night, (finished, when) in enumerate(nights.items()):
+        if night == 0:
+            edit(northwind, when, Churn_Risk__c="Medium",
+                 Description="Strategic account. Renewal at risk since the October reorg; "
+                             "exec sponsor meeting booked.")
+            for c in rnd.sample(contacts, 18):
+                edit(c, when, Email=c["Email"].replace("@example.com", "@mail.example"))
+            ladder = ["Prospecting", "Qualification", "Needs Analysis", "Proposal", "Negotiation"]
+            for o in [o for o in opps if o["StageName"] in ladder[:-1]][:6]:
+                edit(o, when, StageName=ladder[ladder.index(o["StageName"]) + 1])
+            leads = org.objects["Lead"]["records"]
+            for i in range(4):
+                leads.append({"Id": f"00Q9{i:011d}AAA", "Name": f"Web lead {i + 1}",
+                              "Company": COMPANIES[i + 5], "Email": f"lead{i}@web.example",
+                              "IsConverted": False, "Status": "Open", "IsDeleted": False,
+                              "CreatedDate": when, "SystemModstamp": when})
+        elif night == 1:
+            edit(northwind, when, OwnerId="005000000000004AAA", NumberOfEmployees=1450)
+            for o in rnd.sample([o for o in opps if not o["IsClosed"]], 9):
+                edit(o, when, Amount=o["Amount"] + 2500.0)
+            for c in contacts[200:202]:
+                edit(c, when, IsDeleted=True)
+            for a in [a for a in accounts if not a.get("Region__c")][:25]:
+                edit(a, when, Region__c=rnd.choice(["EMEA", "AMER", "APAC"]))
+        else:
+            edit(northwind, when, AnnualRevenue=410000.0, Churn_Risk__c="Low",
+                 Description="Strategic account. Renewed for three years in November; "
+                             "APAC expansion signed.")
+            for c in rnd.sample(contacts, 30):
+                edit(c, when, HasOptedOutOfEmail=not c["HasOptedOutOfEmail"])
+            for i in range(7):
+                opps.append({"Id": f"0069{i:011d}AAA", "Name": f"{COMPANIES[i]} renewal",
+                             "AccountId": accounts[i]["Id"], "StageName": "Qualification",
+                             "Amount": 12000.0 + 3500 * i, "CloseDate": "2027-03-31", "IsClosed": False,
+                             "Is_Partner__c": False, "Source_System__c": "SFDC", "IsDeleted": False,
+                             "OwnerId": "005000000000002AAA", "CreatedDate": when, "SystemModstamp": when})
+        cli_mod.console = cli_mod.stdout = _console()  # not recorded
+        runner.invoke(cli_mod.cli, ["export", "-d", "./acme", "--incremental", "--no-files"], obj={},
+                      catch_exceptions=False)
+        restamp(Path("acme"), finished)
 
 
 def _console() -> Console:
@@ -145,18 +247,20 @@ def main() -> None:
         console.print()
         run(console, runner, ["audit", "./acme"])
         (ROOT / "docs" / "demo.svg").write_text(console.export_svg(title="sf-exit export"), "utf-8")
+        restamp(Path("acme"), "2026-10-31T22:00:00Z")
+        a_month_of_backups(org, runner)
 
         shutil.copytree("acme", "acme-monday")
+        tonight = "2026-11-24T14:30:00.000Z"
         contacts = org.objects["Contact"]["records"]
         for c in contacts[:37]:
-            c.update(Email=c["Email"].replace("@example.com", "@newco.example"),
-                     SystemModstamp="2099-01-01T00:00:00.000Z")
+            edit(c, tonight, Email=c["Email"].replace("@example.com", "@newco.example"))
         for c in contacts[100:105]:
-            c.update(LastName="Smith", SystemModstamp="2099-01-01T00:00:00.000Z")
+            edit(c, tonight, LastName="Smith")
         for c in contacts[40:43]:
-            c.update(IsDeleted=True, SystemModstamp="2099-01-01T00:00:00.000Z")
-        for opp in org.objects["Opportunity"]["records"][:12]:
-            opp.update(StageName="Closed Won", IsClosed=True, SystemModstamp="2099-01-01T00:00:00.000Z")
+            edit(c, tonight, IsDeleted=True)
+        for opp in [o for o in org.objects["Opportunity"]["records"] if not o["IsClosed"]][:12]:
+            edit(opp, tonight, StageName="Closed Won", IsClosed=True)
 
         console = cli_mod.console = cli_mod.stdout = _console()
         run(console, runner, ["sql", "./acme",
@@ -170,8 +274,9 @@ def main() -> None:
         run(console, runner, ["diff", "./acme-monday", "./acme"])
         (ROOT / "docs" / "tools.svg").write_text(console.export_svg(title="sf-exit sql · backup · diff"),
                                                  "utf-8")
+        restamp(Path("acme"), "2026-11-24T22:00:00Z")
         _screenshot(tmp / "acme-monday" / "audit" / "index.html", ROOT / "docs" / "audit.png")
-        _browse_shots(tmp / "acme-monday", ROOT / "docs")
+        _browse_shots(tmp / "acme", ROOT / "docs")
 
         sandbox = demo_org()
         for name in ("Account", "Contact", "Opportunity", "Invoice__c", "Task", "Lead", "FAQ__kav"):
@@ -231,9 +336,29 @@ const {{chromium}} = require('playwright');
 (async () => {{
   const b = await chromium.launch();
   const p = await b.newPage({{viewport: {{width: 1280, height: 860}}, deviceScaleFactor: 2}});
+  await p.goto('{server.url}#/');
+  await p.waitForSelector('#charts svg');
+  await p.waitForTimeout(300);
+  const dash = await p.evaluate(() => document.querySelector('#charts').getBoundingClientRect().bottom + window.scrollY);
+  await p.setViewportSize({{width: 1280, height: Math.ceil(dash + 24)}});
+  await p.waitForTimeout(200);
+  await p.screenshot({{path: '{docs / "dashboard.png"}'}});
+  await p.setViewportSize({{width: 1280, height: 860}});
   await p.goto('{server.url}#/r/001000000000001AAA');
   await p.waitForSelector('#rel table');
+  await p.waitForSelector('.tl');
   await p.screenshot({{path: '{docs / "browse.png"}'}});
+  await p.setViewportSize({{width: 1120, height: 1700}});
+  const hist = await p.evaluate(() => {{
+    const h = [...document.querySelectorAll('h2')].find(e => e.textContent.startsWith('History'));
+    h.scrollIntoView({{block: 'start'}});
+    const m = document.querySelector('#main').getBoundingClientRect();
+    const top = h.getBoundingClientRect().top - 14;
+    const end = document.querySelector('#main').lastElementChild.getBoundingClientRect().bottom + 18;
+    return {{x: m.left, y: Math.max(0, top), w: m.width, h: Math.min(end, 1700) - Math.max(0, top)}};
+  }});
+  await p.screenshot({{path: '{docs / "history.png"}', clip: {{x: hist.x, y: hist.y, width: hist.w, height: hist.h}}}});
+  await p.setViewportSize({{width: 1280, height: 860}});
   await p.goto('{server.url}#/s/northwind');
   await p.waitForSelector('.hit');
   await p.screenshot({{path: '{docs / "browse-search.png"}', clip: {{x: 0, y: 0, width: 1280, height: 560}}}});

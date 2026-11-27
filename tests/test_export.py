@@ -124,18 +124,36 @@ def test_outputs_written(exported):
     assert "Acme Corp" in (out / "REPORT.md").read_text()
 
 
-def test_resume_skips_finished_objects(tmp_path):
+def test_interrupted_run_resumes_but_completed_run_is_never_reused(tmp_path, monkeypatch):
     org = build_org()
-    sf = client_for(org)
-    opts = ExportOptions(out_dir=tmp_path, poll_interval=0, files=False)
-    Exporter(sf, opts).run()
-    first_calls = len(org.calls)
+    opts = ExportOptions(out_dir=tmp_path, poll_interval=0)
+
+    def interrupted(self):  # records are done, then the process dies before files
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Exporter, "export_files", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        Exporter(client_for(org), opts).run()
+    monkeypatch.undo()
+    assert not (tmp_path / "manifest.json").exists()
+
     org.calls.clear()
-    Exporter(client_for(org), opts).run()
-    queries = [c for c in org.calls if c.endswith("/query") or "jobs/query" in c]
-    # only the ContentDocumentLink pass (which depends on fresh ContentDocument Ids) re-queries
-    assert len(queries) <= 3, queries
-    assert len(org.calls) < first_calls
+    resumed = Exporter(client_for(org), opts).run()
+    assert resumed.resumed
+    # no record is fetched again: one describe call, the Organization query, 3 file listings
+    assert sum("/composite" in c for c in org.calls) == 1, org.calls
+    assert sum(c.endswith("/query") for c in org.calls) == 4, org.calls
+    assert not any("jobs/query" in c for c in org.calls)
+    assert resumed.objects["Account"].rows == 24
+
+    # The run completed: the next run must fetch everything again, not reuse stale data.
+    org.objects["Account"]["records"][0]["Name"] = "Renamed later"
+    org.calls.clear()
+    again = Exporter(client_for(org), opts).run()
+    assert not again.resumed
+    assert any("/composite" in c for c in org.calls)
+    names = {r["Id"]: r["Name"] for r in read_csv(tmp_path / "data" / "Account.csv")}
+    assert names["001000000000001AAA"] == "Renamed later"
 
 
 def test_unexportable_object_is_skipped_not_failed(tmp_path):
@@ -149,7 +167,7 @@ def test_unexportable_object_is_skipped_not_failed(tmp_path):
     assert result.objects["Account"].status == "done"
     assert not (tmp_path / "data" / "Contact.csv").exists()
     report = (tmp_path / "REPORT.md").read_text()
-    assert "Failed objects" not in report and "`Contact`" in report
+    assert "## Failed" not in report and "`Contact`" in report
 
 
 def test_permission_error_is_a_real_failure(tmp_path):
@@ -159,7 +177,7 @@ def test_permission_error_is_a_real_failure(tmp_path):
     result = Exporter(client_for(org), opts).run()
     assert result.objects["Contact"].status == "failed"
     assert "INSUFFICIENT_ACCESS" in result.objects["Contact"].error
-    assert "Failed objects" in (tmp_path / "REPORT.md").read_text()
+    assert "## Failed" in (tmp_path / "REPORT.md").read_text()
 
 
 def test_knowledge_articles_exported_per_publish_status(exported):

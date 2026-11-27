@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -75,7 +77,7 @@ def ensure_index(export_dir: Path, force: bool = False,
                 return path
     say = on_progress or (lambda s: None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name("index.db.building")
+    tmp = path.with_name(f"index.db.building-{os.getpid()}-{threading.get_ident()}")
     for stale in (tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")):
         stale.unlink(missing_ok=True)
 
@@ -144,7 +146,7 @@ def ensure_index(export_dir: Path, force: bool = False,
         con.execute("PRAGMA journal_mode=DELETE")
     finally:
         con.close()
-    tmp.replace(path)
+    tmp.replace(path)  # atomic: a concurrent builder simply replaces an identical index
     return path
 
 

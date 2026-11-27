@@ -1,6 +1,6 @@
 # Ask an AI assistant about your Salesforce data
 
-`sf-exit mcp ./export` runs a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI assistant can answer questions from your exported org: "which accounts in EMEA have no open opportunities?", "summarise everything we know about Northwind", "which custom fields look abandoned?".
+`sf-exit mcp ./export` runs a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI assistant can answer questions from your exported org: "which accounts in EMEA have no open opportunities?", "summarise everything we know about Northwind", "who changed this opportunity's amount, and when?", "which custom fields look abandoned?".
 
 It works on the export, not on Salesforce. That means no API limits, no credentials given to the assistant, and no way for it to change anything.
 
@@ -30,6 +30,7 @@ This is the standard configuration format used by MCP clients such as Cursor, VS
 | `query` | A read-only SQL query (SQLite dialect), capped at 200 rows |
 | `search` | Full-text search across record names and key text fields |
 | `get_record` | One record by Id, with lookups resolved, related counts and files |
+| `get_record_history` | One record's timeline across backup runs: created, each update with old → new values, deleted ([time machine](time-machine.md)) |
 | `audit_findings` | The findings from `sf-exit audit`, if it has been run |
 
 ## What the assistant can and can't do

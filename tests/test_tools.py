@@ -118,6 +118,7 @@ def test_cli_export_with_everything(monkeypatch, tmp_path):
         return client_for(org)
 
     monkeypatch.setattr(cli_mod, "make_client", fake)
+    monkeypatch.setenv("SF_EXIT_REDACT_SALT", "a-long-random-secret")
     out = tmp_path / "exp"
     args = ["export", "-d", str(out), "--metadata", "--redact-pii", "--audit"]
     res = CliRunner().invoke(cli_mod.cli, args, obj={})
@@ -125,9 +126,13 @@ def test_cli_export_with_everything(monkeypatch, tmp_path):
     assert "Metadata" in res.output and "Redacted" in res.output
     assert (out / "metadata" / "package.xml").exists()
     assert (out / "audit" / "index.html").exists()
-    res = CliRunner().invoke(cli_mod.cli, args[:3] + ["--incremental", "--no-files"], obj={})
+    res = CliRunner().invoke(cli_mod.cli, args[:3] + ["--redact-pii", "--incremental", "--no-files"],
+                             obj={})
     assert res.exit_code == 0, res.output
     assert "Changed" in res.output
+    monkeypatch.delenv("SF_EXIT_REDACT_SALT")
+    res = CliRunner().invoke(cli_mod.cli, args[:3] + ["--redact-pii", "--incremental"], obj={})
+    assert res.exit_code == 2 and "SF_EXIT_REDACT_SALT" in res.output
 
 
 def test_audit_score_new_findings_and_configuration(tmp_path):
@@ -174,3 +179,14 @@ def test_diff_parallel_matches_serial(export_dir, tmp_path, monkeypatch):
     serial = diff_exports(export_dir, new)
     monkeypatch.setattr(diff_mod, "PARALLEL_THRESHOLD_BYTES", 0)
     assert diff_exports(export_dir, new) == serial
+
+
+def test_diff_compares_numbers_by_value(export_dir, tmp_path):
+    new = tmp_path / "new"
+    shutil.copytree(export_dir, new)
+    path = new / "data" / "Account.csv"
+    text = path.read_text()
+    assert ".0\"" in text
+    path.write_text(text.replace("000.0\"", "000\""))  # same amounts, Bulk-style text
+    diffs = {d.name: d for d in diff_exports(export_dir, new)}
+    assert not diffs["Account"].touched

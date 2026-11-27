@@ -6,6 +6,8 @@ unchanged: pagination, Bulk job polling, result locators, blob downloads and err
 
 from __future__ import annotations
 
+import base64
+import copy
 import csv
 import hashlib
 import io
@@ -58,6 +60,15 @@ class FakeOrg(BaseAdapter):
         self.requires_filter = set()
         self.polls_before_complete = 1
         self.composite = True
+        self.metadata = copy.deepcopy(METADATA_TYPES)
+        self.max_files_per_retrieve = None
+        self.retrieve_requests: List[Dict] = []
+        self.evil_zip_entries: List = []
+        self.failing_types: set = set()
+        self.record_count_denied = False
+        self.billed = 0  # API calls Salesforce would bill: /composite = 1, /composite/batch = N
+        self.break_stream: Dict[str, int] = {}  # path fragment -> responses to cut off mid-body
+        self.drop_connection: Dict[str, int] = {}  # path fragment -> requests to time out
         self.writes = 0
         self.retrieves: Dict[str, Dict] = {}
         self.denied = set()  # objects the user has no access to (INSUFFICIENT_ACCESS)
@@ -96,11 +107,21 @@ class FakeOrg(BaseAdapter):
         path = unquote(url.path)
         qs = {k: v[0] for k, v in parse_qs(url.query).items()}
         self.calls.append(f"{request.method} {path}")
-        raw = request.body.decode() if isinstance(request.body, bytes) else request.body
-        try:
-            body = json.loads(raw) if raw else None
-        except ValueError:
-            body = raw  # SOAP XML
+        ctype = request.headers.get("Content-Type", "")
+        if ctype.startswith("multipart/"):
+            body = _parse_multipart(ctype, request.body)
+        else:
+            raw = request.body.decode() if isinstance(request.body, bytes) else request.body
+            try:
+                body = json.loads(raw) if raw else None
+            except ValueError:
+                body = raw  # SOAP XML
+        for pattern in list(self.drop_connection):
+            if pattern in path:  # simulate a connection reset before the request is answered
+                self.drop_connection[pattern] -= 1
+                if self.drop_connection[pattern] <= 0:
+                    del self.drop_connection[pattern]
+                raise requests.exceptions.ReadTimeout(f"simulated read timeout on {path}")
         try:
             status, payload, headers = self.route(request.method, path, qs, body)
         except _SfErr as e:
@@ -110,14 +131,22 @@ class FakeOrg(BaseAdapter):
         resp.request = request
         resp.url = request.url
         resp.headers = CaseInsensitiveDict(headers or {})
-        if isinstance(payload, (bytes, bytearray)):
-            resp._content = bytes(payload)
-        else:
-            resp._content = json.dumps(payload).encode()
-            resp.headers.setdefault("Content-Type", "application/json")
-        resp._content_consumed = True
         resp.reason = "OK" if status < 400 else "Error"
         resp.encoding = "utf-8"
+        content = bytes(payload) if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode()
+        if not isinstance(payload, (bytes, bytearray)):
+            resp.headers.setdefault("Content-Type", "application/json")
+        for pattern in list(self.break_stream):
+            if pattern in path and status < 400:  # the body is cut off half way through
+                self.break_stream[pattern] -= 1
+                if self.break_stream[pattern] <= 0:
+                    del self.break_stream[pattern]
+                resp.raw = _BrokenStream(content)
+                resp._content_consumed = False
+                resp._content = False
+                return resp
+        resp._content = content
+        resp._content_consumed = True
         return resp
 
     def route(self, method, path, qs, body):
@@ -147,6 +176,8 @@ class FakeOrg(BaseAdapter):
         if rest == "/limits":
             return 200, {"DailyApiRequests": {"Max": 100000, "Remaining": 99000},
                          "DailyBulkV2QueryJobs": {"Max": 10000, "Remaining": 9990}}, {}
+        if rest == "/limits/recordCount" and self.record_count_denied:
+            raise _SfErr(403, "INSUFFICIENT_ACCESS", "requires View Setup and Configuration")
         if rest == "/limits/recordCount":
             names = qs.get("sObjects", "").split(",")
             return 200, {"sObjects": [
@@ -159,7 +190,35 @@ class FakeOrg(BaseAdapter):
             return 200, self._query(unquote(m.group(3)), m.group(1) == "queryAll", int(m.group(2))), {}
         if rest == "/composite/sobjects" and method in ("POST", "PATCH"):
             return 200, [self._write(method, dict(r)) for r in body["records"]], {}
+        m = re.fullmatch(r"/composite/sobjects/(\w+)/(\w+)", rest)
+        if m and method == "PATCH":  # upsert on an external Id field
+            return 200, [self._upsert(m.group(1), m.group(2), dict(r)) for r in body["records"]], {}
+        if rest == "/composite" and method == "POST":
+            if not self.composite:
+                raise _SfErr(404, "NOT_FOUND", "The requested resource does not exist")
+            subs = body["compositeRequest"]
+            if len(subs) > 25:
+                raise _SfErr(400, "INVALID_API_INPUT", "more than 25 subrequests")
+            if sum(1 for s in subs if re.search(r"/(query|queryAll)\b", s["url"])) > 5:
+                raise _SfErr(400, "INVALID_API_INPUT", "more than 5 query subrequests")
+            out = []
+            for sub in subs:
+                u = urlparse(sub["url"])
+                sub_qs = {k: v[0] for k, v in parse_qs(u.query).items()}
+                try:
+                    st, payload, _ = self.route(sub["method"], unquote(u.path), sub_qs, sub.get("body"))
+                    if isinstance(payload, (bytes, bytearray)):
+                        payload = payload.decode()
+                except _SfErr as e:
+                    st, payload = e.status, [{"message": e.msg, "errorCode": e.code}]
+                out.append({"body": payload, "httpHeaders": {}, "httpStatusCode": st,
+                            "referenceId": sub["referenceId"]})
+            return 200, {"compositeResponse": out}, {}
+        m = re.fullmatch(r"/sobjects/(\w+)", rest)
+        if m and method == "POST":
+            return self._insert_one(m.group(1), body)
         if rest == "/composite/batch" and method == "POST":
+            self.billed += len(body["batchRequests"]) - 1
             if not self.composite:
                 raise _SfErr(404, "NOT_FOUND", "The requested resource does not exist")
             results = []
@@ -190,6 +249,78 @@ class FakeOrg(BaseAdapter):
         raise _SfErr(404, "NOT_FOUND", f"no route for {method} {rest}")
 
     # -------------------------------------------------------------- writes
+    def _insert_one(self, name, body):
+        """POST /sobjects/<Object>: JSON, or multipart with a binary part (files)."""
+        blob = None
+        if isinstance(body, dict) and "entity_content" in body:  # multipart upload
+            fields = json.loads(body["entity_content"])
+            blob = body.get("VersionData") or body.get("Body")
+        else:
+            fields = dict(body or {})
+            for k in ("VersionData", "Body"):
+                if k in fields:
+                    blob = base64.b64decode(fields.pop(k))
+        if name == "ContentVersion":
+            if blob is None:
+                raise _SfErr(400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [VersionData]")
+            self.writes += 1
+            vid, did = f"068N{self.writes:011d}AAA", f"069N{self.writes:011d}AAA"
+            parent = fields.pop("FirstPublishLocationId", None)
+            if parent and not self._exists(parent):
+                raise _SfErr(400, "INVALID_CROSS_REFERENCE_KEY", "invalid FirstPublishLocationId")
+            self.objects["ContentVersion"]["records"].append({
+                "Id": vid, "ContentDocumentId": did, "Title": fields.get("Title"),
+                "FileExtension": (fields.get("PathOnClient") or "").rpartition(".")[2] or None,
+                "VersionNumber": "1", "ContentSize": len(blob), "IsLatest": True, "IsDeleted": False,
+                "Checksum": hashlib.md5(blob).hexdigest()})
+            self.objects["ContentDocument"]["records"].append(
+                {"Id": did, "Title": fields.get("Title"), "IsDeleted": False})
+            self.blobs[f"ContentVersion/{vid}"] = blob
+            if parent:
+                self.writes += 1
+                self.objects["ContentDocumentLink"]["records"].append(
+                    {"Id": f"06AN{self.writes:011d}AAA", "ContentDocumentId": did,
+                     "LinkedEntityId": parent, "ShareType": "V"})
+            return 201, {"id": vid, "success": True, "errors": []}, {}
+        if name == "Attachment":
+            if blob is None or not self._exists(fields.get("ParentId")):
+                raise _SfErr(400, "INVALID_CROSS_REFERENCE_KEY", "invalid ParentId")
+            self.writes += 1
+            aid = f"00PN{self.writes:011d}AAA"
+            self.objects["Attachment"]["records"].append(
+                {"Id": aid, "ParentId": fields["ParentId"], "Name": fields.get("Name"),
+                 "BodyLength": len(blob), "IsDeleted": False})
+            self.blobs[f"Attachment/{aid}"] = blob
+            return 201, {"id": aid, "success": True, "errors": []}, {}
+        if name == "ContentDocumentLink":
+            if not (self._exists(fields.get("ContentDocumentId")) and self._exists(fields.get("LinkedEntityId"))):
+                raise _SfErr(400, "INVALID_CROSS_REFERENCE_KEY", "invalid cross reference id")
+            self.writes += 1
+            lid = f"06AN{self.writes:011d}AAA"
+            self.objects["ContentDocumentLink"]["records"].append({"Id": lid, **fields})
+            return 201, {"id": lid, "success": True, "errors": []}, {}
+        res = self._write("POST", {"attributes": {"type": name}, **fields})
+        if not res["success"]:
+            raise _SfErr(400, res["errors"][0]["statusCode"], res["errors"][0]["message"])
+        return 201, res, {}
+
+    def _upsert(self, name, ext_field, rec):
+        obj = self.objects.get(name)
+        if obj is None:
+            return {"success": False, "errors": [{"statusCode": "INVALID_TYPE", "message": name}]}
+        meta = {f["name"]: f for f in obj["describe"]["fields"]}
+        if not meta.get(ext_field, {}).get("externalId"):
+            return {"success": False, "errors": [{"statusCode": "INVALID_FIELD",
+                                                  "message": f"{ext_field} is not an External ID field"}]}
+        value = rec.get(ext_field)
+        existing = next((r for r in obj["records"] if value and r.get(ext_field) == value), None)
+        if existing:
+            res = self._write("PATCH", {"attributes": {"type": name}, "id": existing["Id"],
+                                        **{k: v for k, v in rec.items() if k != "attributes"}})
+            return {**res, "created": False}
+        res = self._write("POST", rec)
+        return {**res, "created": True}
+
     def _exists(self, record_id):
         return any(r.get("Id") == record_id for o in self.objects.values() for r in o["records"])
 
@@ -340,8 +471,24 @@ METADATA_TYPES = {
     "Layout": {"Account-Account Layout": {"layouts/Account-Account Layout.layout": "<Layout/>"}},
     "Report": {"SalesReports": {"reports/SalesReports-meta.xml": "<ReportFolder/>"},
                "SalesReports/Pipeline": {"reports/SalesReports/Pipeline.report": "<Report/>"}},
+    "EmailTemplate": {
+        "ClassicFolder": {"email/ClassicFolder-meta.xml": "<EmailFolder/>"},
+        "ClassicFolder/Welcome": {"email/ClassicFolder/Welcome.email": "Hello"},
+        "LightningFolder": {"email/LightningFolder-meta.xml": "<EmailTemplateFolder/>"},
+        "LightningFolder/Renewal": {"email/LightningFolder/Renewal.email": "Renew"}},
+    "StandardValueSet": {"Industry": {"standardValueSets/Industry.standardValueSet": "<StandardValueSet/>"},
+                         "OpportunityStage": {"standardValueSets/OpportunityStage.standardValueSet":
+                                              "<StandardValueSet/>"}},
+    "Profile": {"Admin": {}},  # content depends on the rest of the request: see _profile_xml
+    "PermissionSet": {"Sales_Ops": {}},
     "BrokenType": {"X": {"broken/X": "boom"}},
 }
+DIRECTORIES = {"ApexClass": "classes", "Flow": "flows", "CustomObject": "objects", "Layout": "layouts",
+               "Report": "reports", "EmailTemplate": "email", "StandardValueSet": "standardValueSets",
+               "Profile": "profiles", "PermissionSet": "permissionsets", "BrokenType": "broken"}
+FOLDERS = {"ReportFolder": ("Report", ["SalesReports"]), "EmailFolder": ("EmailTemplate", ["ClassicFolder"]),
+           "EmailTemplateFolder": ("EmailTemplate", ["LightningFolder"])}
+NO_WILDCARD = {"Report", "EmailTemplate", "StandardValueSet"}
 
 
 def _soap_ok(op, inner):
@@ -356,6 +503,32 @@ def _soap_fault(code, msg):
             f'</soapenv:Fault></soapenv:Body></soapenv:Envelope>').encode()
 
 
+def _profile_xml(kind, selected):
+    """Like the real Metadata API: a profile only carries permissions for the components
+    retrieved in the same request."""
+    parts = [f'<?xml version="1.0" encoding="UTF-8"?>\n<{kind} xmlns="http://soap.sforce.com/2006/04/metadata">']
+    for cls in sorted(selected.get("ApexClass", [])):
+        parts.append(f"    <classAccesses>\n        <apexClass>{cls}</apexClass>\n"
+                     "        <enabled>true</enabled>\n    </classAccesses>")
+    if kind == "Profile":
+        parts.append("    <custom>false</custom>")
+    for obj in sorted(selected.get("CustomObject", [])):
+        parts.append(f"    <fieldPermissions>\n        <editable>true</editable>\n"
+                     f"        <field>{obj}.Name</field>\n        <readable>true</readable>\n"
+                     "    </fieldPermissions>")
+    if kind == "PermissionSet":
+        parts.append("    <label>Sales Ops</label>")
+    for layout in sorted(selected.get("Layout", [])):
+        parts.append(f"    <layoutAssignments>\n        <layout>{layout}</layout>\n    </layoutAssignments>")
+    for obj in sorted(selected.get("CustomObject", [])):
+        parts.append(f"    <objectPermissions>\n        <allowRead>true</allowRead>\n"
+                     f"        <object>{obj}</object>\n    </objectPermissions>")
+    parts.append("    <userPermissions>\n        <enabled>true</enabled>\n"
+                 "        <name>ApiEnabled</name>\n    </userPermissions>")
+    parts.append(f"</{kind}>")
+    return "\n".join(parts)
+
+
 def _soap(self, xml):
     import base64 as b64
     import xml.etree.ElementTree as ET
@@ -367,52 +540,107 @@ def _soap(self, xml):
     op = op_el.tag.split("}")[1]
     txt = lambda el, n: [c.text for c in el.iter() if c.tag.endswith("}" + n)]  # noqa: E731
     self.calls.append(f"SOAP {op}")
+    md = self.metadata
     if op == "describeMetadata":
         inner = "<result>" + "".join(
-            f"<metadataObjects><xmlName>{t}</xmlName><inFolder>{'true' if t == 'Report' else 'false'}"
-            "</inFolder></metadataObjects>" for t in METADATA_TYPES) + "</result>"
+            f"<metadataObjects><directoryName>{DIRECTORIES.get(t, t.lower())}</directoryName>"
+            f"<inFolder>{'true' if t in ('Report', 'EmailTemplate') else 'false'}</inFolder>"
+            f"<xmlName>{t}</xmlName></metadataObjects>" for t in md) + "</result>"
         return 200, _soap_ok(op, inner), {"Content-Type": "text/xml"}
     if op == "listMetadata":
         out = []
         for q in [e for e in op_el.iter() if e.tag.endswith("}queries")]:
             t = txt(q, "type")[0]
             folder = (txt(q, "folder") or [None])[0]
-            if t == "ReportFolder":
-                names = ["SalesReports"]
-            elif t == "Report":
-                names = [m for m in METADATA_TYPES["Report"] if folder and m.startswith(folder + "/")]
+            if t in FOLDERS:
+                names = FOLDERS[t][1]
+            elif t in ("Report", "EmailTemplate"):
+                names = [m for m in md.get(t, {}) if folder and m.startswith(folder + "/")]
+            elif t == "StandardValueSet":
+                names = []  # like the real API: not reliably listed
             else:
-                names = list(METADATA_TYPES.get(t, {}))
+                names = list(md.get(t, {}))
             out += [f"<result><fullName>{n}</fullName><type>{t}</type></result>" for n in names]
         return 200, _soap_ok(op, "".join(out)), {"Content-Type": "text/xml"}
     if op == "retrieve":
         types = {}
         for t_el in [e for e in op_el.iter() if e.tag.endswith("}types")]:
             types[txt(t_el, "name")[0]] = txt(t_el, "members")
-        if "BrokenType" in types:
+        if "BrokenType" in types or set(types) & self.failing_types:
             return 500, _soap_fault("UNKNOWN_EXCEPTION", "An unexpected error occurred"), {}
+        selected = {t: [m for m in md.get(t, {}) if (("*" in mems and t not in NO_WILDCARD) or m in mems)]
+                    for t, mems in types.items()}
+        files = sum(max(1, len(md[t][m])) for t, ms in selected.items() for m in ms if t in md)
+        if self.max_files_per_retrieve and files > self.max_files_per_retrieve:
+            return 500, _soap_fault("LIMIT_EXCEEDED",
+                                    f"Too many files in the retrieve ({files}); the limit is "
+                                    f"{self.max_files_per_retrieve}"), {}
+        self.retrieve_requests.append(types)
         rid = f"09S{len(self.retrieves):015d}"
-        self.retrieves[rid] = types
+        self.retrieves[rid] = (types, selected)
         return 200, _soap_ok(op, f"<result><id>{rid}</id><done>false</done></result>"), {}
     if op == "checkRetrieveStatus":
         rid = txt(op_el, "asyncProcessId")[0]
+        types, selected = self.retrieves[rid]
         buf = io.BytesIO()
+        messages = []
         with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr("unpackaged/package.xml", "<Package/>")
-            for t, members in self.retrieves[rid].items():
-                for m, files in METADATA_TYPES.get(t, {}).items():
-                    if "*" in members and t != "Report" or m in members:
-                        for path, content in files.items():
-                            zf.writestr("unpackaged/" + path, content)
+            zf.writestr("package.xml", "<Package/>")
+            for t, ms in selected.items():
+                for m in ms:
+                    if t in ("Profile", "PermissionSet"):
+                        ext = ".profile" if t == "Profile" else ".permissionset"
+                        zf.writestr(f"{DIRECTORIES[t]}/{m}{ext}", _profile_xml(t, selected))
+                    for path, content in md[t][m].items():
+                        zf.writestr(path, content)
+            for t, mems in types.items():
+                for m in mems:
+                    if m != "*" and m not in md.get(t, {}):
+                        messages.append(f"<messages><fileName>package.xml</fileName><problem>Entity of "
+                                        f"type '{t}' named '{m}' cannot be found</problem></messages>")
+            for name, content in self.evil_zip_entries:
+                zf.writestr(name, content)
         z = b64.b64encode(buf.getvalue()).decode()
         inner = (f"<result><done>true</done><status>Succeeded</status><id>{rid}</id>"
-                 f"<messages><fileName>unpackaged/package.xml</fileName><problem>Entity of type "
-                 f"'Layout' named 'Ghost' cannot be found</problem></messages><zipFile>{z}</zipFile></result>")
+                 + "".join(messages[:3]) + f"<zipFile>{z}</zipFile></result>")
         return 200, _soap_ok(op, inner), {}
     return 500, _soap_fault("INVALID_OPERATION", op), {}
 
 
 FakeOrg.soap = _soap
+
+
+class _BrokenStream:
+    """A response body that stops half way through, the way a reset connection does."""
+
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def stream(self, chunk_size=65536, decode_content=True):
+        from urllib3.exceptions import ProtocolError
+
+        half = max(1, len(self.content) // 2)
+        yield self.content[:half]
+        raise ProtocolError("Connection broken: IncompleteRead")
+
+    def close(self):
+        pass
+
+    def release_conn(self):
+        pass
+
+
+def _parse_multipart(ctype, body: bytes):
+    from email.parser import BytesParser
+    from email.policy import HTTP
+
+    msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body)
+    out = {}
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        data = part.get_payload(decode=True)
+        out[name] = data.decode() if name == "entity_content" else data
+    return out
 
 
 class _SfErr(Exception):

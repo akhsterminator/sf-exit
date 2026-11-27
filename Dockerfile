@@ -6,7 +6,7 @@ RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[all]"
 
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source="https://github.com/akhsterminator/sf-exit" \
-      org.opencontainers.image.description="Move all of an organisation's data out of Salesforce" \
+      org.opencontainers.image.description="Export, audit, browse, back up and restore a Salesforce org in open formats" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /wheels /wheels
 RUN pip install --no-cache-dir --no-index --find-links /wheels "sf-exit[all]" \

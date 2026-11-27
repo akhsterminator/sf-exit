@@ -49,6 +49,8 @@ sf-exit export --client-id 3MVG9... --username integration@acme.com --jwt-key-fi
 # add --sandbox for sandboxes
 ```
 
+The token's audience is `https://login.salesforce.com`, or `https://test.salesforce.com` for sandboxes (detected from `--instance-url`, including enhanced-domain sandbox URLs). If your org needs another one, set `SF_AUDIENCE_URL` (the Salesforce CLI's `SFDX_AUDIENCE_URL` also works).
+
 ## Access token
 
 If you already have a session from another tool:
@@ -72,3 +74,4 @@ Run `sf-exit doctor` to check these:
 - **API Enabled**: required.
 - **View All Data**: otherwise the export only contains records the user can see.
 - **Query All Files**: otherwise files that aren't shared with the user are silently left out.
+- **View Setup and Configuration**: lets `plan` read record counts up front and choose Bulk API for big objects before the first query. Without it, the export still works: it counts records from the first page of each query instead.

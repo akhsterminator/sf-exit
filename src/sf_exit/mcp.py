@@ -65,6 +65,12 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}},
     },
     {
+        "name": "get_record_history",
+        "description": "Every recorded version of one record across backup runs: when it was created, "
+                       "which fields changed (old -> new) and when it was deleted.",
+        "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}},
+    },
+    {
         "name": "audit_findings",
         "description": "Data-quality findings from `sf-exit audit` (unused fields, duplicates, overdue "
                        "pipeline...) if the audit has been run for this export.",
@@ -134,6 +140,20 @@ class ExportTools:
                 "related": [{"object": x["object"], "via": x["field"], "count": x["count"]}
                             for x in r["related"]],
                 "files": r["files"]}
+
+    def get_record_history(self, id: str) -> Any:  # noqa: A002
+        from sf_exit.history import HistoryError, record_history
+
+        try:
+            h = record_history(self.export_dir, id)
+        except HistoryError as exc:
+            raise ToolError(str(exc)) from exc
+        return {"object": h["object"], "id": id, "exists_now": bool(h["current"]),
+                "history_since": h["baseline"],
+                "versions": [{"at": v["at"], "change": v["change"],
+                              "fields": {k: {"old": _clip(a), "new": _clip(b)}
+                                         for k, (a, b) in v["fields"].items()}}
+                             for v in h["versions"]]}
 
     def audit_findings(self) -> Any:
         path = self.export_dir / "audit" / "audit.json"

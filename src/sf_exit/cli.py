@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import click
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -27,7 +28,7 @@ from rich.table import Table
 from sf_exit import __version__
 from sf_exit.auth import SANDBOX_LOGIN, AuthConfig, AuthError, login
 from sf_exit.client import SalesforceClient, SalesforceError
-from sf_exit.exporter import Exporter, ExportOptions, Progress
+from sf_exit.exporter import Exporter, ExportError, ExportOptions, Progress
 from sf_exit.loader import LoadError, load
 from sf_exit.utils import human_bytes
 
@@ -83,11 +84,15 @@ def handle_errors(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except (AuthError, LoadError, FileNotFoundError) as exc:
+        except (AuthError, LoadError, ExportError, FileNotFoundError) as exc:
             console.print(f"[bold red]Error:[/] {exc}")
             sys.exit(2)
         except SalesforceError as exc:
             console.print(f"[bold red]Salesforce error:[/] {exc}")
+            sys.exit(2)
+        except requests.RequestException as exc:
+            console.print(f"[bold red]Network error:[/] {exc}\nRun the same command again to "
+                          "resume where it stopped.")
             sys.exit(2)
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/] Run the same command again to resume where you left off.")
@@ -201,7 +206,9 @@ def cli(ctx, verbose):
     Backups:
       sf-exit export --org my-org -d ./backup --incremental   # only what changed
       sf-exit diff ./backup-monday ./backup-tuesday            # what changed between two
-      sf-exit restore ./backup --org sandbox -i Account -i Contact   # put records back
+      sf-exit history ./backup 001xx000003DGb2AAG              # one record's timeline
+      sf-exit snapshot ./backup --as-of 2026-11-20 -o ./nov20  # the org as it was
+      sf-exit restore ./backup --org sandbox -i Account -i Contact --files
 
     \b
     AI assistants:
@@ -273,11 +280,16 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
     done = [o for o in result.objects.values() if o.status == "done"]
     files = sum(v["count"] for v in result.files.values())
     fbytes = sum(v["bytes"] for v in result.files.values())
-    lines = [f"[bold green]Export complete[/] in {_dur(elapsed)}", "",
+    title = "Export complete" if result.ok else "Export finished with problems"
+    lines = [f"[bold {'green' if result.ok else 'yellow'}]{title}[/] in {_dur(elapsed)}"
+             + (" [dim](resumed)[/]" if result.resumed else ""), "",
              f"  Records   [bold]{result.total_rows:,}[/] from {len(done):,} objects"]
     if result.incremental_since:
-        changed = sum(o.changed or 0 for o in done)
-        lines.append(f"  Changed   [bold]{changed:,}[/] records since {result.incremental_since}")
+        lines.append(f"  Changed   [bold]{result.changed_records:,}[/] records since "
+                     f"{result.incremental_since}")
+    elif result.changes_dir:
+        lines.append(f"  History   [bold]{result.changed_records:,}[/] records changed since the "
+                     "last export (sf-exit history)")
     if opts.files:
         lines.append(f"  Files     [bold]{files:,}[/] ({human_bytes(fbytes)})")
     if result.metadata and "components" in result.metadata:
@@ -296,16 +308,21 @@ def export(ctx, out_dir, include, exclude, include_deleted, no_files, files_only
         summary += f"\n\n  [red]{len(result.failed)} object(s) failed[/]; re-run to retry, details in REPORT.md"
     if result.file_errors:
         summary += f"\n  [red]{result.file_errors} file(s) failed[/]; see files/index.csv"
-    console.print(Panel.fit(summary, border_style="green" if not result.failed else "yellow"))
+    for kind in result.listing_errors:
+        summary += f"\n  [red]{kind} files could not be listed[/]; see REPORT.md"
+    partial = [o.name for o in done if o.warnings]
+    if partial or result.warnings:
+        summary += f"\n  [yellow]{len(partial) + len(result.warnings)} warning(s)[/] in REPORT.md"
+    console.print(Panel.fit(summary, border_style="green" if result.ok else "yellow"))
 
     if run_audit_after and opts.data:
         ctx.invoke(audit, export_dir=out_dir, out=None, open_report=False)
     if load_to:
         ctx.invoke(load_cmd, export_dir=out_dir, to=load_to, lowercase=False, replace=True, only=())
-    elif not result.failed and opts.data:
-        console.print(f"Next: [bold]sf-exit audit {out_dir}[/] · [bold]sf-exit sql {out_dir}[/] · "
-                      f"[bold]sf-exit load {out_dir} --to duckdb:///sf.duckdb[/]")
-    if result.failed:
+    elif result.ok and opts.data:
+        console.print(f"Next: [bold]sf-exit browse {out_dir}[/] · [bold]sf-exit audit {out_dir}[/] · "
+                      f"[bold]sf-exit sql {out_dir}[/]")
+    if not result.ok:
         sys.exit(1)
 
 
@@ -361,9 +378,15 @@ def plan(include, exclude, top, **auth):
     console.print(files)
 
     bulk_objs = sum(1 for n in counts.values() if n >= 10_000)
-    est_calls = len(names) * 2 + bulk_objs * 10 + sum(
-        n // 2000 + 1 for n in counts.values() if n < 10_000)
+    small = [n for n in counts.values() if n < 10_000]
+    est_calls = (-(-len(names) // 25)  # describes: 25 per /composite call
+                 + -(-len(names) // 5)  # first pages: 5 per /composite call
+                 + sum(max(0, n // 2000) for n in small) + bulk_objs * 10)
     lim = _limits(sf)
+    if sf.record_counts_available is False:
+        console.print("[yellow]Record counts are unavailable[/] (the user lacks 'View Setup and "
+                      "Configuration'), so sizes below are unknown, not zero. The export still "
+                      "picks the right API per object from its first page.")
     console.print(
         f"\n≈ [bold]{total_rows:,}[/] records in {len(names):,} objects "
         f"([dim]{len(skipped)} skipped, run with -v for reasons[/]).\n"
@@ -490,7 +513,8 @@ def doctor(**auth):
     if user_id:
         try:
             soql = (
-                "SELECT PermissionsViewAllData, PermissionsQueryAllFiles, PermissionsApiEnabled "
+                "SELECT PermissionsViewAllData, PermissionsQueryAllFiles, PermissionsApiEnabled, "
+                "PermissionsViewSetup "
                 "FROM PermissionSet WHERE Id IN (SELECT PermissionSetId FROM PermissionSetAssignment "
                 f"WHERE AssigneeId = '{user_id}')"
             )
@@ -509,6 +533,8 @@ def doctor(**auth):
               "Without it you only export records your user can see.")
         check("Query All Files", perms.get("PermissionsQueryAllFiles", False),
               "Without it, files not shared with you are silently skipped.")
+        check("View Setup and Configuration", perms.get("PermissionsViewSetup", False),
+              "Lets sf-exit read record counts for faster engine choices and `plan` estimates.")
     else:
         check("Permissions", None, "Could not read your permission sets; ask an admin to confirm "
               "'View All Data' and 'Query All Files'.")
@@ -763,8 +789,10 @@ def _build_index(export_dir: str, force: bool = False) -> None:
 @click.option("--port", default=8484, show_default=True, help="Port on 127.0.0.1 (0 = any free port).")
 @click.option("--no-open", is_flag=True, help="Don't open the browser automatically.")
 @click.option("--reindex", is_flag=True, help="Rebuild the local index even if it looks current.")
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Interface to listen on. Use 0.0.0.0 only inside a container (e.g. Docker).")
 @handle_errors
-def browse(export_dir, port, no_open, reindex):
+def browse(export_dir, port, no_open, reindex, host):
     """Click through an exported org in your browser: offline, read-only, searchable.
 
     Record pages with lookups, related lists and attached files, like Salesforce itself, but
@@ -774,12 +802,15 @@ def browse(export_dir, port, no_open, reindex):
 
     _build_index(export_dir, reindex)
     try:
-        server = BrowseServer(Path(export_dir), port)
+        server = BrowseServer(Path(export_dir), port, host)
     except OSError as exc:
         console.print(f"[bold red]Error:[/] can't listen on port {port} ({exc}). Try --port 0.")
         sys.exit(2)
     console.print(f"[bold green]Browsing[/] [bold]{export_dir}[/] at [bold cyan]{server.url}[/]"
                   "  [dim](Ctrl-C to stop)[/]")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(f"[yellow]Listening on {host}:[/] anyone who can reach this machine on port "
+                      f"{server.server_address[1]} can read the export. Use only inside a container.")
     if not no_open:
         import webbrowser
 
@@ -821,8 +852,14 @@ def mcp_cmd(export_dir):
 @click.option("--execute", is_flag=True, help="Actually create records. Without it, only the plan is shown.")
 @click.option("--allow-production", is_flag=True, help="Permit restoring into a production org.")
 @click.option("--allow-same-org", is_flag=True, help="Permit restoring into the org the export came from.")
+@click.option("--upsert", multiple=True, metavar="OBJECT.FIELD",
+              help="Match records on this External ID field (glob on the object): re-runs update "
+                   "instead of duplicating. The old Salesforce Id is stored in it: --upsert '*.Legacy_Id__c'.")
+@click.option("--files", "with_files", is_flag=True,
+              help="Also upload Salesforce Files and Attachments and link them to the restored records.")
 @handle_errors
-def restore(export_dir, include, exclude, execute, allow_production, allow_same_org, **auth):
+def restore(export_dir, include, exclude, execute, allow_production, allow_same_org, upsert,
+            with_files, **auth):
     """Re-create records from an export in another org, with relationships intact. [experimental]
 
     Parents are inserted before children, every lookup is rewritten to the new Ids, and
@@ -852,7 +889,7 @@ def restore(export_dir, include, exclude, execute, allow_production, allow_same_
         with bar:
             result = Restorer(sf, Path(export_dir), include, exclude, execute=execute,
                               allow_production=allow_production, allow_same_org=allow_same_org,
-                              on_progress=on_progress).run()
+                              upsert=upsert, files=with_files, on_progress=on_progress).run()
     except RestoreError as exc:
         console.print(f"[bold red]Refused:[/] {exc}")
         sys.exit(2)
@@ -860,12 +897,16 @@ def restore(export_dir, include, exclude, execute, allow_production, allow_same_
     table = Table(title="Restore order" if not execute else "Restored", title_justify="left")
     cols = [("#", "right"), ("Object", "left"), ("Records", "right"), ("Fields", "right"),
             ("Second-pass lookups", "left")]
+    if result.same_org:
+        cols.insert(3, ("Still in org", "right"))
     if execute:
         cols += [("Created", "right"), ("Failed", "right")]
     for c, j in cols:
         table.add_column(c, justify=j)
     for i, p in enumerate(result.order, start=1):
         row = [str(i), p.name, f"{p.rows:,}", str(len(p.fields)), ", ".join(p.deferred)]
+        if result.same_org:
+            row.insert(3, f"[dim]{result.still_present.get(p.name, 0):,}[/]")
         if execute:
             failed = result.failed.get(p.name, 0)
             row += [f"[green]{result.created.get(p.name, 0):,}[/]", f"[red]{failed:,}[/]" if failed else ""]
@@ -876,16 +917,33 @@ def restore(export_dir, include, exclude, execute, allow_production, allow_same_
     if not result.order:
         console.print("[yellow]Nothing to restore: no exported object matched --include.[/]")
         sys.exit(1)
+    if result.same_org:
+        kept = sum(result.still_present.values())
+        console.print(f"\n[bold]Same org:[/] {kept:,} of these records still exist there and "
+                      f"{'are' if execute else 'will be'} left alone. Only missing (deleted) records "
+                      f"{'were' if execute else 'will be'} re-created, as new records with new Ids.")
     if not execute:
         console.print("\n[bold]Dry run:[/] nothing was written. Add [bold]--execute[/] to create these records.")
         return
     unmapped = sum(result.unmapped_lookups.values())
     console.print(
         f"\n[bold green]Created {result.total_created:,} records[/]"
+        + (f", updated {sum(result.updated.values()):,}" if result.updated else "")
         + (f", re-linked {sum(result.relinked.values()):,} in the second pass" if result.relinked else "")
         + (f", skipped {sum(result.skipped_existing.values()):,} already restored" if result.skipped_existing else "")
         + (f", [red]{result.total_failed:,} failed[/]" if result.total_failed else "") + "."
     )
+    if with_files:
+        console.print(f"Files: [bold]{result.files_restored:,}[/] uploaded"
+                      + (f", {result.links_created:,} extra links" if result.links_created else "")
+                      + (f", {result.files_skipped:,} already restored" if result.files_skipped else "")
+                      + (f", [red]{result.files_failed:,} failed[/]" if result.files_failed else "") + ".")
+    if result.skipped_unknown:
+        console.print(f"[yellow]{sum(result.skipped_unknown.values()):,} records skipped[/] because an "
+                      "earlier run may have created them (see unknown.csv).")
+    if result.kept_lookups:
+        console.print(f"[dim]{sum(result.kept_lookups.values()):,} lookups kept their original Ids "
+                      "(same org: those records still exist).[/]")
     users = sum(result.unmatched_users.values())
     if users:
         console.print(f"[dim]{users:,} records had an owner with no matching active user in the target "
@@ -895,11 +953,83 @@ def restore(export_dir, include, exclude, execute, allow_production, allow_same_
         console.print(f"[yellow]{unmapped:,} lookups left empty[/] because the record they pointed to "
                       f"isn't in the export: {top}")
     console.print(f"Id map and errors: [bold]{result.out_dir}[/]")
-    if result.total_failed:
+    if result.total_failed or result.files_failed:
         sys.exit(1)
 
 
+# ----------------------------------------------------------------- history
+@cli.command("history")
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("record_id")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@handle_errors
+def history_cmd(export_dir, record_id, as_json):
+    """Every recorded version of one record: when it was created, changed or deleted.
+
+    History is recorded each time you export into the same folder (e.g. nightly with
+    --incremental). See also `sf-exit snapshot` and the History tab in `sf-exit browse`.
+    """
+    from sf_exit.history import HistoryError, record_history
+
+    try:
+        h = record_history(Path(export_dir), record_id)
+    except HistoryError as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        sys.exit(2)
+    if as_json:
+        click.echo(json.dumps(h, indent=1, default=str))
+        return
+    current = h["current"]
+    title = (current or {}).get("Name") or (current or {}).get("Subject") or record_id
+    stdout.print(f"[bold]{h['object']}[/] [bold]{title}[/] ({record_id})"
+                 + ("" if current else "  [red]deleted[/]"))
+    if not h["versions"]:
+        stdout.print(f"[dim]No changes recorded since {str(h.get('baseline') or '')[:10]}.[/]")
+        return
+    styles = {"created": "green", "updated": "cyan", "deleted": "red"}
+    for v in h["versions"]:
+        st = styles.get(v["change"], "white")
+        stdout.print(f"\n[{st}]●[/] [bold]{v['at'].replace('T', ' ')[:16]}[/]  [{st}]{v['change']}[/]")
+        if v["fields"]:
+            t = Table(show_header=False, box=None, padding=(0, 1))
+            for name, (old, new) in sorted(v["fields"].items()):
+                t.add_row(f"  {name}", f"[red]{old or '–'}[/]", "→", f"[green]{new or '–'}[/]")
+            stdout.print(t)
+
+
+@cli.command("snapshot")
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--as-of", "as_of", required=True, metavar="WHEN",
+              help="A date (end of that day, UTC) or timestamp: 2026-11-20 or 2026-11-20T09:30:00Z.")
+@click.option("-o", "--out", "out_dir", required=True, type=click.Path(file_okay=False),
+              help="New folder for the snapshot.")
+@click.option("--with-files", is_flag=True, help="Include the binary files (hard-linked when possible).")
+@handle_errors
+def snapshot_cmd(export_dir, as_of, out_dir, with_files):
+    """Rebuild the export as the org was at any moment since history began.
+
+    The snapshot is a normal export folder: browse it, audit it, diff it against today,
+    load it into a database, or restore records from it.
+    """
+    from sf_exit.history import HistoryError, parse_when, snapshot
+
+    try:
+        when = parse_when(as_of)
+        with console.status(f"Rebuilding the org as of {when.isoformat()}…"):
+            snap = snapshot(Path(export_dir), when, Path(out_dir), with_files=with_files)
+    except HistoryError as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        sys.exit(2)
+    console.print(f"[bold green]Snapshot[/] of [bold]{snap['org'].get('name', '')}[/] as of "
+                  f"[bold]{snap['snapshot']['as_of']}[/]: {snap['totals']['rows']:,} records in "
+                  f"{snap['totals']['objects']:,} objects → [bold]{out_dir}[/]")
+    console.print(f"Next: [bold]sf-exit browse {out_dir}[/] · [bold]sf-exit diff {out_dir} {export_dir}[/]")
+
+
 def main() -> None:
+    import multiprocessing
+
+    multiprocessing.freeze_support()  # the audit/diff process pools in single-file binaries
     cli(obj={})
 
 

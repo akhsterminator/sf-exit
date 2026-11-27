@@ -1,12 +1,11 @@
 [build-system]
-requires = ["hatchling>=1.21"]
+requires = ["hatchling>=1.21", "hatch-fancy-pypi-readme>=24.1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "sf-exit"
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 description = "Export, audit, browse, back up and restore a Salesforce org: every record, file and piece of metadata, in open formats you own."
-readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
@@ -60,6 +59,21 @@ Changelog = "https://github.com/akhsterminator/sf-exit/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/sf_exit/__init__.py"
+
+# PyPI can't resolve the README's relative links and images: point them at GitHub.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '<img src="(docs/[^"]+)"'
+replacement = '<img src="https://raw.githubusercontent.com/akhsterminator/sf-exit/main/\1"'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(((?:docs/|LICENSE|CONTRIBUTING\.md|CHANGELOG\.md)[^)]*)\)'
+replacement = '](https://github.com/akhsterminator/sf-exit/blob/main/\1)'
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sf_exit"]

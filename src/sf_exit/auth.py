@@ -13,11 +13,14 @@ Resolution order (first one that has enough information wins):
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -97,6 +100,25 @@ def from_sf_cli(org: Optional[str]) -> Session:
     return Session(result["instanceUrl"], result["accessToken"], f"sf-cli:{result.get('alias') or result.get('username') or org}", refresh)
 
 
+def is_sandbox_url(url: str) -> bool:
+    """Sandbox and scratch-org login hosts (same rules as the Salesforce CLI)."""
+    host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()
+    return (host == "test.salesforce.com"
+            or host.endswith((".sandbox.my.salesforce.com", ".scratch.my.salesforce.com",
+                              ".sandbox.lightning.force.com", ".scratch.lightning.force.com"))
+            or bool(re.match(r"^[a-z0-9-]+--[a-z0-9-]+\.(?:[a-z0-9-]+\.)?my\.salesforce\.com$", host))
+            or bool(re.match(r"^cs\d+\.", host)))
+
+
+def jwt_audience(login_url: str) -> str:
+    """The JWT 'aud' claim: never the My Domain URL, always login. or test.salesforce.com,
+    unless overridden with SF_AUDIENCE_URL (e.g. for Government Cloud)."""
+    override = os.environ.get("SF_AUDIENCE_URL") or os.environ.get("SFDX_AUDIENCE_URL")
+    if override:
+        return override.rstrip("/")
+    return SANDBOX_LOGIN if is_sandbox_url(login_url) else PRODUCTION_LOGIN
+
+
 def jwt_flow(cfg: AuthConfig) -> Session:
     try:
         import jwt  # type: ignore
@@ -104,8 +126,7 @@ def jwt_flow(cfg: AuthConfig) -> Session:
         raise AuthError("JWT login needs an extra: pip install 'sf-exit[jwt]'") from exc
     with open(cfg.jwt_key_file or "", encoding="utf-8") as fh:
         key = fh.read()
-    sandbox = "test.salesforce.com" in cfg.login_url or ".sandbox.my.salesforce.com" in cfg.login_url
-    audience = SANDBOX_LOGIN if sandbox else PRODUCTION_LOGIN
+    audience = jwt_audience(cfg.login_url)
 
     def fetch() -> dict:
         assertion = jwt.encode(

@@ -40,38 +40,60 @@ def count_csv_rows(path: Path) -> int:
 
 
 def verify_offline(export_dir: Path, on_check: Optional[Callable[[Check], None]] = None) -> List[Check]:
+    """Re-count every CSV and re-hash every file against manifest.json.
+
+    Anything the export itself reported as incomplete fails here too: failed objects,
+    objects with partial results, files that failed to download or whose MD5 didn't match
+    Salesforce's checksum, and file kinds that could not be listed."""
     m = load_manifest(export_dir)
     checks: List[Check] = []
     emit = on_check or (lambda c: None)
+
+    def add(c: Check) -> None:
+        checks.append(c)
+        emit(c)
+
     for name, obj in m["objects"].items():
-        if obj["status"] != "done":
+        if obj["status"] == "failed":
+            add(Check(name, "records", None, None, False, f"export failed: {obj.get('error', '')[:200]}"))
             continue
+        if obj["status"] != "done":
+            continue  # skipped: Salesforce doesn't allow exporting it (listed in REPORT.md)
         path = export_dir / obj["file"]
         if not path.exists():
-            c = Check(name, "records", obj["rows"], None, False, "CSV file missing")
-        else:
-            rows = count_csv_rows(path)
-            sha_ok = not obj.get("sha256") or file_sha256(path) == obj["sha256"]
-            detail = "" if sha_ok else "SHA-256 differs from manifest (file changed since export)"
-            c = Check(name, "records", obj["rows"], rows, rows == obj["rows"] and sha_ok, detail)
-        checks.append(c)
-        emit(c)
+            add(Check(name, "records", obj["rows"], None, False, "CSV file missing"))
+            continue
+        rows = count_csv_rows(path)
+        sha_ok = not obj.get("sha256") or file_sha256(path) == obj["sha256"]
+        problems = []
+        if not sha_ok:
+            problems.append("SHA-256 differs from manifest (file changed since export)")
+        problems += [w for w in obj.get("warnings") or [] if w.startswith("partial")]
+        add(Check(name, "records", obj["rows"], rows, rows == obj["rows"] and not problems,
+                  "; ".join(problems)))
+    for kind, err in (m.get("file_listing_errors") or {}).items():
+        add(Check(f"files/{kind}", "file", None, None, False, f"could not be listed: {err[:200]}"))
     index = export_dir / "files" / "index.csv"
     if index.exists():
-        bad = 0
-        total = 0
+        altered = failed = mismatched = total = 0
         with open(index, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
-                if not row["status"].startswith("ok"):
-                    continue
                 total += 1
+                status = row.get("status", "")
+                if status == "checksum-mismatch":
+                    mismatched += 1
+                    continue
+                if not status.startswith("ok"):
+                    failed += 1
+                    continue
                 p = export_dir / row["path"]
                 if not p.exists() or file_sha256(p) != row["sha256"]:
-                    bad += 1
-        c = Check("files/", "file", total, total - bad, bad == 0,
-                  f"{bad} file(s) missing or altered" if bad else "")
-        checks.append(c)
-        emit(c)
+                    altered += 1
+        bad = altered + failed + mismatched
+        detail = ", ".join(f"{n} {what}" for n, what in (
+            (altered, "missing or altered"), (failed, "failed to download"),
+            (mismatched, "differ from Salesforce's checksum")) if n)
+        add(Check("files/", "file", total, total - bad, bad == 0, detail))
     return checks
 
 
@@ -111,12 +133,11 @@ def _live_count(client: SalesforceClient, export_dir: Path, name: str, deleted: 
         variants = plan_object(json.loads(schema.read_text("utf-8"))).where_variants
     if not variants:
         return client.count(name, include_deleted=deleted)
-    total, errors = 0, []
-    for where in variants:
+    total = 0
+    for where in variants:  # a partial count would hide a partial export: fail instead
         try:
             total += client.count(name, include_deleted=deleted, where=where)
         except SalesforceError as exc:
-            errors.append(exc)
-    if len(errors) == len(variants):
-        raise errors[0]
+            raise SalesforceError(f"rows matching {where} could not be counted: {exc}",
+                                  exc.status, exc.code) from exc
     return total

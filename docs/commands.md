@@ -8,7 +8,9 @@ Every command has `--help` with all options. Commands that talk to Salesforce ac
 | [`metadata`](#metadata) | ✅ | Configuration only: Apex, Flows, objects, layouts, reports… |
 | [`plan`](#plan) | ✅ | Dry run: sizes, row counts, API calls needed |
 | [`doctor`](#doctor) | ✅ | Checks your permissions and limits |
-| [`restore`](#restore) | ✅ writes | Re-create records in a sandbox or another org, relationships intact |
+| [`restore`](#restore) | ✅ writes | Re-create records (and files) in a sandbox or another org, relationships intact |
+| [`history`](#history) | – | One record's timeline across backup runs |
+| [`snapshot`](#snapshot) | – | Rebuild the export as the org was at any moment |
 | [`browse`](#browse) | – | Click through the exported org in your browser |
 | [`mcp`](#mcp) | – | MCP server so AI assistants can query the export |
 | [`audit`](#audit) | – | Health score, findings and a searchable data dictionary |
@@ -29,24 +31,40 @@ sf-exit export --org prod -d ./prod-export
 | `-i, --include PATTERN` | Only these objects. Glob, case-insensitive, repeatable: `-i Account -i 'Invoice*__c'` |
 | `-x, --exclude PATTERN` | Skip these objects: `-x '*History' -x '*Share'` |
 | `--include-deleted` | Add Recycle Bin and archived records (`queryAll`) |
-| `--incremental` | Only fetch records changed or deleted since the last export into this folder, then merge them in. Changed rows are also kept in `changes/<timestamp>/` |
+| `--incremental` | Only fetch records changed or deleted since each object was last exported into this folder, then merge them in. Changed rows (and the versions they replaced) are kept in `changes/<run>/` |
 | `--metadata` | Also retrieve configuration into `metadata/` (see [metadata](#metadata)) |
 | `--metadata-type TYPE` | Limit metadata to these types (implies `--metadata`) |
 | `--redact OBJECT.FIELD` | Hash these fields (glob): `--redact 'Contact.Email' --redact '*.Phone'` |
-| `--redact-pii` | Hash every email and phone field plus names like Birthdate, SSN, Street, PostalCode, IBAN |
+| `--redact-pii` | Hash personal data: emails, phones, person names, usernames, addresses, birthdates, and fields named like SSN, passport or IBAN (list below) |
 | `--no-files` / `--files-only` | Skip binary files, or download only files |
 | `--all-file-versions` | Every ContentVersion, not just the latest |
 | `--engine auto\|bulk\|rest` | Force an API. `auto` uses Bulk API 2.0 for objects with 10k+ rows |
 | `--workers N` / `--file-workers N` | Parallelism (default 4 objects, 8 file downloads) |
-| `--fresh` | Ignore resume state and start over |
+| `--fresh` | Discard an interrupted run's progress instead of resuming it |
 | `--audit` | Run `sf-exit audit` when the export finishes |
 | `--load TARGET` | Run `sf-exit load` when the export finishes |
 
-**Resuming.** Interrupt with Ctrl-C at any time. Running the same command again skips finished objects and files that were already downloaded.
+**Resuming.** Interrupt with Ctrl-C at any time, or lose the connection, or hit a CI timeout. Running the same command again resumes the interrupted run: finished objects are skipped and downloaded files are kept. A run that *completed* is never reused, so the next run exports everything afresh (or only the changes, with `--incremental`).
 
-**Redaction.** Hashes are `redacted:<16 hex chars>` of a salted SHA-256 of the lower-cased value. The same value gets the same hash throughout an export, so joins and duplicate checks still work. Set `SF_EXIT_REDACT_SALT` to keep hashes stable across runs. Ids and lookups are never redacted, and files are not redacted.
+**Network failures.** Reads are retried with backoff, including connections that drop in the middle of a Bulk results page or a file download. One object or file that still fails is reported in `REPORT.md` and the exit code is 1, but it never stops the rest of the export.
 
-**Incremental mode.** This uses `SystemModstamp`, with one hour of overlap that's removed by Id when merging, and `queryAll`, so records sent to the Recycle Bin are removed from the CSVs. Objects whose fields changed, or that lack `SystemModstamp`, are re-exported in full. Records hard-deleted (purged from the Recycle Bin) between runs can't be seen by any API, so run a full export now and then, for example weekly.
+**History.** Every run into an existing export folder records what changed in `changes/<run>/`. See [time-machine.md](time-machine.md).
+
+**Redaction.** Hashes are `redacted:<16 hex chars>` of a salted SHA-256 of the lower-cased value. The same value gets the same hash throughout an export, so joins and duplicate checks still work. `--redact-pii` hashes:
+- email and phone fields;
+- person names (`FirstName`, `LastName`, `MiddleName`, `Suffix`, and `Name` on Contact, Lead, User and Individual);
+- `User.Username`, `Alias`, `CommunityNickname` and `FederationIdentifier`;
+- address parts (street, city, postal code, latitude, longitude);
+- birthdates;
+- text fields whose names mention email, phone, mobile, fax, SSN, passport, tax ID, national ID, IBAN or bank account.
+
+Free text such as `Description` is *not* hashed: add `--redact 'Case.Description'` for those. Ids and lookups are never redacted, and files are not redacted. Incremental runs with redaction need `SF_EXIT_REDACT_SALT`, so hashes stay consistent from one night to the next. Changing redaction settings forces a full re-export, so a file never mixes hashed and clear values.
+
+**Incremental mode.** For each object, sf-exit asks for rows whose `SystemModstamp` is later than that object's own last export, minus an hour of overlap (duplicates are removed by Id when merging). It uses `queryAll`, so records sent to the Recycle Bin are removed from the CSVs, and archived activities are dropped as a normal export would. Objects whose fields changed, or that lack `SystemModstamp`, are re-exported in full. `ContentDocumentLink` is always refreshed in full, because sharing a file doesn't change the file. Two things only a full export refreshes:
+- records hard-deleted (purged from the Recycle Bin) between runs, which no API can see;
+- formula fields on rows that didn't change.
+
+Run a plain `sf-exit export` into the same folder now and then, for example weekly.
 
 ## metadata
 
@@ -70,7 +88,7 @@ Read-only. It lists the largest objects, file counts and sizes, and estimates th
 
 ## doctor
 
-This checks API access, **View All Data**, **Query All Files** and your remaining daily API and Bulk limits. Without the two permissions, Salesforce silently returns only what your user can see.
+This checks API access, **View All Data**, **Query All Files**, **View Setup and Configuration** and your remaining daily API and Bulk limits. Without the first two, Salesforce silently returns only what your user can see. Without the third, `plan` can't read record counts up front (the export still works and counts as it goes).
 
 ## restore
 
@@ -85,9 +103,27 @@ sf-exit restore ./prod-export --org my-sandbox -i Account -i Contact -i Opportun
 | `-x, --exclude PATTERN` | Objects to leave out |
 | `--execute` | Create the records. Without it, only the plan is shown |
 | `--allow-production` | Permit a production org as the target |
-| `--allow-same-org` | Permit the org the export came from as the target |
+| `--allow-same-org` | Permit the org the export came from as the target. Only records that no longer exist there are re-created |
+| `--upsert OBJECT.FIELD` | Match records on an External ID field (glob on the object, e.g. `'*.Legacy_Id__c'`), filled with the old Salesforce Id. Re-runs then update instead of duplicating |
+| `--files` | Also upload Salesforce Files and Attachments and link them to the restored records |
 
 Parents are inserted before children, lookups are rewritten to the new Ids, and the Id map and errors are written to `restore/<org id>/`. Experimental: see [restore.md](restore.md) for exactly what it does and doesn't do.
+
+## history
+
+```bash
+sf-exit history ./backup 0015g00000ABCDEAA4          # timeline: created / updated (old → new) / deleted
+sf-exit history ./backup 0015g00000ABCDEAA4 --json
+```
+
+## snapshot
+
+```bash
+sf-exit snapshot ./backup --as-of 2026-11-20 -o ./backup-nov20                 # end of that day, UTC
+sf-exit snapshot ./backup --as-of 2026-11-20T09:30:00Z -o ./before --with-files
+```
+
+Writes a complete export folder as the org was at that moment, built from the history recorded in `changes/`. See [time-machine.md](time-machine.md).
 
 ## browse
 
@@ -95,7 +131,7 @@ Parents are inserted before children, lookups are rewritten to the new Ids, and 
 sf-exit browse ./prod-export
 ```
 
-A local, read-only web app over the export: list views, record pages, related lists, files and full-text search. Options: `--port` (default 8484, `0` for any free port), `--no-open`, `--reindex`. See [browse.md](browse.md).
+A local, read-only web app over the export: a dashboard, list views, record pages with each record's history, related lists, files, a "what changed" page and full-text search. Options: `--port` (default 8484, `0` for any free port), `--no-open`, `--reindex`, `--host` (use `0.0.0.0` only inside a container). See [browse.md](browse.md).
 
 ## mcp
 
@@ -103,7 +139,7 @@ A local, read-only web app over the export: list views, record pages, related li
 sf-exit mcp ./prod-export
 ```
 
-A Model Context Protocol server over stdio with read-only tools (`list_objects`, `describe_object`, `query`, `search`, `get_record`, `audit_findings`). See [ai-assistants.md](ai-assistants.md) for client set-up.
+A Model Context Protocol server over stdio with read-only tools (`list_objects`, `describe_object`, `query`, `search`, `get_record`, `get_record_history`, `audit_findings`). See [ai-assistants.md](ai-assistants.md) for client set-up.
 
 ## audit
 
@@ -132,7 +168,7 @@ sf-exit diff ./old ./new --details ./changes   # one CSV per object: Id, change,
 sf-exit diff ./old ./new --json
 ```
 
-Shows records added, removed and changed per object, which fields changed most, and objects or fields that appeared or disappeared. `LastViewedDate`, `LastReferencedDate` and `SystemModstamp` are ignored because they change without anyone editing the record.
+Shows records added, removed and changed per object, which fields changed most, and objects or fields that appeared or disappeared. `LastViewedDate`, `LastReferencedDate` and `SystemModstamp` are ignored because they change without anyone editing the record. Numbers are compared by value, so `1000` and `1000.0` are the same. `LastModifiedDate` and `LastModifiedById` count as changes but are left out of the "most-changed fields" ranking, since every edit changes them.
 
 ## load
 

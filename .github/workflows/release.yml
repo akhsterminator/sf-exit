@@ -4,6 +4,8 @@ name: Release
 # create tag "vX.Y.Z" → Generate release notes → Publish) or with `gh release create vX.Y.Z`.
 # Or push a version tag (git tag v1.2.3 && git push origin v1.2.3): the release-assets
 # job then creates the GitHub release itself, with notes taken from CHANGELOG.md.
+# Publishing a release in the UI can fire both triggers for the same tag: every job is
+# idempotent (PyPI skips files it already has, assets are uploaded with --clobber).
 on:
   release:
     types: [published]
@@ -37,6 +39,8 @@ jobs:
       - uses: actions/download-artifact@v8
         with: { name: dist, path: dist }
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   docker:
     runs-on: ubuntu-latest
@@ -100,5 +104,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  binaries:
+    # Single-file executables: no Python needed. Built after the release exists.
+    needs: release-assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, asset: sf-exit-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, asset: sf-exit-linux-arm64 }
+          - { os: macos-latest, asset: sf-exit-macos-arm64 }
+          - { os: windows-latest, asset: sf-exit-windows-x86_64.exe }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyinstaller ".[duckdb,jwt]"
+      - run: python scripts/build_binary.py --name ${{ matrix.asset }}
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./dist/${{ matrix.asset }} --version
+          ./dist/${{ matrix.asset }} export --help > /dev/null
+          ./dist/${{ matrix.asset }} audit --help > /dev/null
+      - name: Upload to the release
+        shell: bash
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.asset }}" --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  checksums:
+    needs: [release-assets, binaries]
+    if: always() && needs.release-assets.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: SHA256SUMS for every release asset
+        run: |
+          mkdir assets && cd assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'sf-exit-*' --pattern 'sf_exit-*'
+          sha256sum * > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

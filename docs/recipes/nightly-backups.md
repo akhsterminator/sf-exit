@@ -10,7 +10,7 @@ Each night this setup:
 4. writes a **diff** of what changed today
 5. uploads the export, plus a dated copy of today's changes
 
-A weekly full export catches records that were hard-deleted (purged from the Recycle Bin), which no API can detect incrementally.
+A weekly full export catches records that were hard-deleted (purged from the Recycle Bin), which no API can detect incrementally, and refreshes formula fields on unchanged rows. Every run, full or incremental, also records what changed in `changes/`, which gives you [a time machine](../time-machine.md): `sf-exit history` for any record and `sf-exit snapshot --as-of` for the whole org.
 
 ## GitHub Actions + S3
 
@@ -45,7 +45,7 @@ jobs:
         run: cp -r sf previous || mkdir previous
       - name: Export
         run: |
-          if [ "${{ github.event.schedule }}" = "47 3 * * 0" ]; then MODE=--fresh; else MODE=--incremental; fi
+          if [ "${{ github.event.schedule }}" = "47 3 * * 0" ]; then MODE=; else MODE=--incremental; fi
           sf-exit export -d sf $MODE --include-deleted --metadata
       - name: Verify
         run: sf-exit verify sf
@@ -65,7 +65,7 @@ Turn on **versioning** on the bucket and add a lifecycle rule (for example, keep
 ```bash
 # crontab -e
 17 2 * * 1-6  cd /srv/sf && sf-exit export --org prod -d current --incremental --include-deleted >> backup.log 2>&1
-47 3 * * 0    cd /srv/sf && sf-exit export --org prod -d current --fresh --include-deleted --metadata >> backup.log 2>&1
+47 3 * * 0    cd /srv/sf && sf-exit export --org prod -d current --include-deleted --metadata >> backup.log 2>&1
 ```
 
 Snapshot the folder with your existing backup tool (restic, borg, ZFS snapshots…). Because unchanged CSVs and files don't change, deduplicating backup tools store each night's changes very cheaply.

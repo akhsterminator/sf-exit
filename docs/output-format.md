@@ -11,6 +11,8 @@ Everything sf-exit writes is plain files, so other tools can read an export with
 - Compound fields (`BillingAddress`, geolocation) are represented by their component fields.
 - Base64 fields (file bodies) aren't in the CSV. The binaries are in `files/`.
 
+- Numbers are written exactly as Salesforce stores them (no floating-point rounding), so `0.1` stays `0.1` and large currency amounts keep every digit.
+
 Whichever API exported an object (Bulk or REST), its CSV uses the same format.
 
 ## `files/index.csv`
@@ -30,15 +32,32 @@ To find the files attached to a record, join `ContentDocumentLink.LinkedEntityId
 
 ## `manifest.json`
 
-Machine-readable: tool version, org, API version, totals, and for each object its status, row count, engine and SHA-256. It also lists skipped objects and why, plus per-kind file totals.
+Machine-readable: tool version, org, API version, totals, and for each object its status, row count, engine, SHA-256, warnings and when it was last exported (the incremental watermark). It also lists skipped objects and why, per-kind file totals, `file_listing_errors` (file queries that failed, so `verify` fails too), and `runs`: when each export run into this folder started and finished, with how many records changed.
 
 ## `metadata/` (with `--metadata`)
 
 A standard Metadata API folder: `package.xml` plus one directory per type (`classes/`, `triggers/`, `flows/`, `objects/`, `layouts/`, `reports/`…). Deploy it with `sf project deploy start --metadata-dir`, or convert it to source format with `sf project convert mdapi`. Problems are listed in `metadata/retrieve-warnings.txt`.
 
-## `changes/<timestamp>/` (with `--incremental`)
+## `changes/<run>/`
 
-For each object, the rows that were added, updated or deleted in that incremental run, in the same CSV format as `data/`. Deleted rows have `IsDeleted = "true"`. These snapshots are the history of your org: keep them and you can see what any record looked like on any night.
+Written by every run into an existing export folder that finds changes ([time machine](time-machine.md)):
+
+| File | Contents |
+|---|---|
+| `<Object>.csv` | The new version of each record created, updated or deleted in this run, in the same CSV format as `data/`. Deleted rows have `IsDeleted = "true"` |
+| `<Object>.before.csv` | The version of each of those records before this run (absent for new records) |
+| `run.json` | `stamp`, `started_at`, `finished_at`, `incremental`, and changed records per object |
+
+`sf-exit history` and `sf-exit snapshot` read these folders. Keep them and you can see what any record looked like after any run.
+
+## `restore/<org id>/` (written by `sf-exit restore`)
+
+| File | Contents |
+|---|---|
+| `id-map.csv` | Old Id → new Id for every restored record (re-runs skip these) |
+| `errors.csv` | Records Salesforce rejected, with its error message |
+| `files-map.csv` | Files uploaded with `--files` (old Id → new Id) |
+| `unknown.csv` | Records whose insert outcome is unknown after a network failure. Check the org, then delete the file to retry them |
 
 ## `audit/` (with `--audit` or `sf-exit audit`)
 
@@ -48,6 +67,6 @@ For each object, the rows that were added, updated or deleted in that incrementa
 
 With `--redact` or `--redact-pii`, chosen fields hold `redacted:<16 hex>` instead of the value. `manifest.json` → `redacted` lists which fields were hashed in each object.
 
-## `.sf-exit/state.json`
+## `.sf-exit/`
 
-Resume bookkeeping. You can delete it, or pass `--fresh`, to start over.
+Internal bookkeeping: `state.json` lets an interrupted run resume (pass `--fresh` to discard it) and `index.db` is the search index used by `browse` and `mcp`. Both can be deleted at any time.

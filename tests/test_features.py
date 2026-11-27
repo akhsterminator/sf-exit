@@ -2,6 +2,7 @@
 
 import csv
 import json
+import re
 
 from sf_exit.exporter import Exporter, ExportOptions
 
@@ -86,8 +87,10 @@ def test_incremental_reexports_object_when_fields_change(tmp_path):
     Exporter(client_for(org), opts).run()
     org.objects["Account"]["describe"]["fields"].append({"name": "Tier__c", "type": "string"})
     opts.incremental = True
-    result = Exporter(client_for(org), opts).run()
-    assert result.objects["Account"].changed is None  # full re-export
+    exporter = Exporter(client_for(org), opts)
+    result = exporter.run()
+    assert "Account" not in exporter.incremental  # full re-export, not a merge
+    assert result.objects["Account"].changed == 0  # ...and the new empty field isn't a change
     assert "Tier__c" in next(iter(rows_by_id(tmp_path / "data" / "Account.csv").values()))
 
 
@@ -100,9 +103,10 @@ def test_redaction_hashes_consistently(tmp_path):
     assert all(r["Email"].startswith("redacted:") for r in contacts)
     assert all(r["LastName"].startswith("redacted:") for r in contacts)
     assert contacts[0]["LastName"] == contacts[1]["LastName"]  # same input -> same hash
-    assert not contacts[0]["FirstName"].startswith("redacted:")
+    assert contacts[0]["FirstName"].startswith("redacted:")  # person names are PII
+    assert contacts[0]["HasOptedOutOfEmail"] in ("true", "false")  # booleans never hashed
     assert contacts[0]["AccountId"].startswith("001")  # Ids/lookups never redacted
-    assert set(result.objects["Contact"].redacted) == {"Email", "LastName", "Birthdate"}
+    assert set(result.objects["Contact"].redacted) == {"Email", "FirstName", "LastName", "Birthdate"}
     users = list(rows_by_id(tmp_path / "data" / "User.csv").values())
     assert users[0]["Email"].startswith("redacted:")
     m = json.loads((tmp_path / "manifest.json").read_text())
@@ -124,7 +128,7 @@ def test_metadata_export(tmp_path):
     # the type that breaks retrieve is isolated and reported, the rest still succeeds
     assert "BrokenType" in result.metadata["failed_types"]
     warnings = (md / "retrieve-warnings.txt").read_text()
-    assert "FAILED BrokenType" in warnings and "Ghost" in warnings
+    assert "FAILED BrokenType" in warnings
 
 
 def test_metadata_include_filter(tmp_path):
@@ -133,3 +137,80 @@ def test_metadata_include_filter(tmp_path):
     result = Exporter(client_for(build_org()), opts).run()
     assert result.metadata["types"] == 2
     assert not (tmp_path / "metadata" / "objects").exists()
+
+
+def _md_export(tmp_path, org, **kw):
+    opts = ExportOptions(out_dir=tmp_path, poll_interval=0, data=False, files=False, metadata=True, **kw)
+    return Exporter(client_for(org), opts).run()
+
+
+def test_metadata_profiles_carry_every_permission(tmp_path):
+    org = build_org()
+    org.metadata.pop("BrokenType")
+    org.metadata["ApexClass"]["Billing"] = {"classes/Billing.cls": "public class Billing {}"}
+    _md_export(tmp_path, org)
+    # every retrieve included the profiles, so each permission section survived the merge
+    assert all({"Profile", "PermissionSet"} <= set(r) for r in org.retrieve_requests)
+    admin = (tmp_path / "metadata" / "profiles" / "Admin.profile").read_text()
+    for needle in ("<apexClass>InvoiceService</apexClass>", "<apexClass>Billing</apexClass>",
+                   "<field>Account.Name</field>", "<object>Invoice__c</object>",
+                   "<layout>Account-Account Layout</layout>", "<name>ApiEnabled</name>"):
+        assert admin.count(needle) == 1, needle
+    sections = re.findall(r"^    <(\w+)>", admin, re.M)
+    assert sections == sorted(sections)  # Metadata API order: alphabetical by element
+    assert admin.count("<custom>false</custom>") == 1
+    ps = (tmp_path / "metadata" / "permissionsets" / "Sales_Ops.permissionset").read_text()
+    assert "<object>Account</object>" in ps and ps.count("<label>Sales Ops</label>") == 1
+
+
+def test_metadata_oversized_types_are_split_by_component(tmp_path):
+    org = build_org()
+    org.metadata.pop("BrokenType")
+    for i in range(6):
+        org.metadata["ApexClass"][f"C{i}"] = {f"classes/C{i}.cls": "x", f"classes/C{i}.cls-meta.xml": "y"}
+    org.max_files_per_retrieve = 5
+    result = _md_export(tmp_path, org)
+    assert result.metadata["failed_types"] == {}
+    classes = sorted(p.name for p in (tmp_path / "metadata" / "classes").glob("*.cls"))
+    assert classes == ["C0.cls", "C1.cls", "C2.cls", "C3.cls", "C4.cls", "C5.cls", "InvoiceService.cls"]
+    assert "<members>C5</members>" in (tmp_path / "metadata" / "package.xml").read_text()
+
+
+def test_metadata_email_templates_and_standard_picklists(tmp_path):
+    org = build_org()
+    org.metadata.pop("BrokenType")
+    _md_export(tmp_path, org)
+    md = tmp_path / "metadata"
+    assert (md / "email" / "LightningFolder" / "Renewal.email").exists()  # EmailTemplateFolder
+    assert (md / "email" / "ClassicFolder" / "Welcome.email").exists()
+    assert (md / "standardValueSets" / "OpportunityStage.standardValueSet").exists()
+    assert not (md / "retrieve-warnings.txt").exists()  # missing standard sets are expected
+
+
+def test_metadata_rerun_drops_deleted_components_but_keeps_failed_types(tmp_path):
+    org = build_org()
+    org.metadata.pop("BrokenType")
+    _md_export(tmp_path, org)
+    assert (tmp_path / "metadata" / "flows" / "Onboarding.flow-meta.xml").exists()
+    org.metadata["Flow"].pop("Onboarding")  # deleted in the org
+    org.failing_types = {"Layout"}  # and Layouts fail to retrieve this time
+    result = _md_export(tmp_path, org)
+    md = tmp_path / "metadata"
+    assert not (md / "flows" / "Onboarding.flow-meta.xml").exists()
+    assert (md / "layouts" / "Account-Account Layout.layout").exists()  # previous version kept
+    assert "Layout" in result.metadata["failed_types"]
+    assert "previous version kept" in (md / "retrieve-warnings.txt").read_text()
+    assert "<name>Layout</name>" in (md / "package.xml").read_text()
+    assert not (tmp_path / ".sf-exit" / "metadata-new").exists()
+
+
+def test_metadata_zip_cannot_write_outside_its_folder(tmp_path):
+    org = build_org()
+    org.metadata.pop("BrokenType")
+    org.evil_zip_entries = [("../metadata-evil/pwned.cls", "x"), ("/abs/pwned.cls", "x"),
+                            ("classes/../../escape.cls", "x")]
+    _md_export(tmp_path, org)
+    assert not (tmp_path / "metadata-evil").exists()
+    assert not (tmp_path / "escape.cls").exists()
+    assert not list(tmp_path.rglob("pwned.cls"))
+    assert "unsafe path" in (tmp_path / "metadata" / "retrieve-warnings.txt").read_text()

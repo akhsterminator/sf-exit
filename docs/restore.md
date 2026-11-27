@@ -6,7 +6,7 @@ It is the only sf-exit command that writes to Salesforce, so it is careful by de
 
 - **Dry run unless you pass `--execute`.** Without it you only see the plan.
 - **Sandboxes and Developer Edition orgs only**, unless you pass `--allow-production`.
-- **Refuses the org the export came from** unless you pass `--allow-same-org`, because it creates new records and would duplicate anything that still exists.
+- **Refuses the org the export came from** unless you pass `--allow-same-org`. Even then it only re-creates records that no longer exist there (see [below](#bringing-back-deleted-records)).
 
 It's marked experimental because Salesforce orgs vary enormously (validation rules, triggers, required fields). Always try it on a sandbox first.
 
@@ -37,17 +37,43 @@ sf-exit restore ./export --org my-sandbox -i Account -i Contact -i Opportunity -
 
 Re-run the same command. Records already in `id-map.csv` are skipped, so an interrupted restore continues without duplicates.
 
-One caveat: writes are never retried automatically. If a batch times out, sf-exit can't know whether Salesforce processed it, so it records the batch as failed. Check the target org for those records before re-running.
+## Files
+
+`--files` uploads the newest version of every Salesforce File linked to a restored record, links it to all of the restored records it was linked to, and re-creates Attachments on their restored parents. Uploads stream from disk (up to 2 GB each). `files-map.csv` records what was uploaded, so re-running doesn't upload anything twice.
+
+## Upsert: restores that are safe to re-run
+
+```bash
+sf-exit restore ./export --org my-sandbox -i Account -i Contact --upsert '*.Legacy_Id__c' --execute
+```
+
+Create a text field marked **External ID** and **Unique** (here `Legacy_Id__c`) on the objects you restore. sf-exit fills it with each record's original Salesforce Id, or with the exported value if the export has one, and upserts on it. Re-running the restore, or later restoring a newer export into the same sandbox, then **updates** the records it created before instead of duplicating them, and a batch that hit a network error can simply be retried. For an explicitly named object, a field that isn't an External ID is reported before anything is written.
+
+## Bringing back deleted records
+
+Restoring into the org the export came from (`--allow-same-org`) re-creates only the records that are missing there. Before writing anything, sf-exit checks which exported records still exist (a query per object, or one Bulk job for big objects) and leaves them alone, so `-i Contact` brings back the deleted contacts without duplicating the others. The plan shows how many still exist. Recovered records are new records with new Ids. Their lookups to parents that still exist keep the original Ids, so recovered contacts are re-attached to their accounts.
+
+Combine this with a [snapshot](time-machine.md) to recover what was deleted after a given moment, as it was then:
+
+```bash
+sf-exit snapshot ./backup --as-of 2026-11-20T09:00:00Z -o ./before-the-cleanup
+sf-exit restore ./before-the-cleanup --org prod -i Contact --allow-same-org --allow-production   # read the plan first!
+```
+
+To put old *values* back on records that still exist, for example after a bad import, `sf-exit diff ./before-the-cleanup ./backup` shows exactly which fields changed. Then load the columns you want back from the snapshot's `data/Contact.csv` with an update in Data Loader, matching on `Id`.
+
+## When the network fails mid-write
+
+A batch whose outcome is unknown (the connection dropped *after* it was sent) is never retried blindly. sf-exit writes those records' old Ids to `restore/<org id>/unknown.csv` and stops. Re-running skips them, so nothing is created twice. After checking the org, delete the file to retry them. With `--upsert` this can't happen: upserts are safe to retry, so sf-exit simply retries them.
 
 ## What it doesn't do (yet)
 
 | Not restored | Use instead |
 |---|---|
-| Files and attachments | Data Loader, or the ContentVersion API, with `files/index.csv` and `id-map.csv` to re-link |
 | Metadata (objects, fields, Apex, Flows) | `sf project deploy start --metadata-dir ./export/metadata`, **before** restoring records |
 | Users, profiles, sharing rows, field history | Recreate users first so owners can be matched |
 | Original Ids and created dates | New records get new Ids. Created dates need Salesforce's "Set Audit Fields" permission, which isn't used |
-| Updating existing records (upsert) | Planned |
+| Documents (the old folder-based kind) and old file versions | Only the newest version of each Salesforce File is uploaded |
 
 ## Tips
 

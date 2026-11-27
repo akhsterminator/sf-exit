@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -16,6 +18,9 @@ csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 # Fields that change without anyone editing the record.
 NOISE = {"LastViewedDate", "LastReferencedDate", "SystemModstamp"}
+# Change with every edit, so they say nothing about *what* changed: left out of the ranking.
+AUDIT_FIELDS = {"LastModifiedDate", "LastModifiedById"}
+NUMERIC_TYPES = {"int", "long", "double", "currency", "percent"}
 PARALLEL_THRESHOLD_BYTES = 64 * 1024 * 1024
 
 
@@ -43,15 +48,37 @@ def _header(path: Path) -> List[str]:
         return next(csv.reader(fh), [])
 
 
-def _hashes(path: Path, cols: List[str]) -> Dict[str, bytes]:
+def _canon(value: str, numeric: bool) -> str:
+    """Numbers compare by value: '1000', '1000.0' and '1E+3' are the same amount."""
+    if numeric and value:
+        try:
+            return format(Decimal(value).normalize(), "f")
+        except InvalidOperation:
+            return value
+    return value
+
+
+def _numeric_columns(export_dir: Path, name: str) -> Set[str]:
+    schema = export_dir / "schema" / f"{name}.json"
+    if not schema.exists():
+        return set()
+    try:
+        fields = json.loads(schema.read_text("utf-8")).get("fields", [])
+    except ValueError:
+        return set()
+    return {f["name"] for f in fields if f.get("type") in NUMERIC_TYPES}
+
+
+def _hashes(path: Path, cols: List[str], numeric: Set[str] = frozenset()) -> Dict[str, bytes]:
     out: Dict[str, bytes] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         header = next(reader, [])
-        idx = [header.index(c) for c in cols]
+        idx = [(header.index(c), c in numeric) for c in cols]
         for row in reader:
             if row:
-                h = hashlib.blake2b("\x1f".join(row[i] for i in idx).encode(), digest_size=10)
+                h = hashlib.blake2b("\x1f".join(_canon(row[i], n) for i, n in idx).encode(),
+                                    digest_size=10)
                 out[row[0]] = h.digest()
     return out
 
@@ -88,7 +115,8 @@ def diff_object(old: Optional[Path], new: Optional[Path], name: str,
     d.fields_added = [c for c in nh if c not in oh]
     d.fields_removed = [c for c in oh if c not in nh]
     common = [c for c in nh if c in oh and c not in NOISE]
-    a, b = _hashes(old, common), _hashes(new, common)
+    numeric = _numeric_columns(new.parent.parent, name) | _numeric_columns(old.parent.parent, name)
+    a, b = _hashes(old, common, numeric), _hashes(new, common, numeric)
     d.old_rows, d.new_rows = len(a), len(b)
     added = b.keys() - a.keys()
     removed = a.keys() - b.keys()
@@ -101,8 +129,9 @@ def diff_object(old: Optional[Path], new: Optional[Path], name: str,
         counts: Counter = Counter()
         detail_rows = []
         for k in sorted(changed):
-            diffs = [c for c in common if old_rows[k].get(c) != new_rows[k].get(c)]
-            counts.update(diffs)
+            diffs = [c for c in common if _canon(old_rows[k].get(c) or "", c in numeric)
+                     != _canon(new_rows[k].get(c) or "", c in numeric)]
+            counts.update(c for c in diffs if c not in AUDIT_FIELDS)
             for c in diffs:
                 detail_rows.append([k, "changed", c, old_rows[k].get(c, ""), new_rows[k].get(c, "")])
         d.changed_fields = dict(counts.most_common())

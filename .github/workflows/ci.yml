@@ -70,6 +70,20 @@ jobs:
           sf-exit --version
           sf-exit export --help > /dev/null
 
+  binary:
+    # The single-file build the release publishes: catch PyInstaller breakage before tagging.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyinstaller ".[duckdb,jwt]"
+      - run: python scripts/build_binary.py --name sf-exit
+      - run: |
+          ./dist/sf-exit --version
+          ./dist/sf-exit export --help > /dev/null
+          ./dist/sf-exit browse --help > /dev/null
+
   docker:
     runs-on: ubuntu-latest
     steps:
