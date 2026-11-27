@@ -185,8 +185,8 @@ def test_diff_compares_numbers_by_value(export_dir, tmp_path):
     new = tmp_path / "new"
     shutil.copytree(export_dir, new)
     path = new / "data" / "Account.csv"
-    text = path.read_text()
-    assert ".0\"" in text
-    path.write_text(text.replace("000.0\"", "000\""))  # same amounts, Bulk-style text
+    data = path.read_bytes()  # bytes: text mode on Windows would rewrite multi-line values
+    assert b'.0"' in data
+    path.write_bytes(data.replace(b'000.0"', b'000"'))  # same amounts, Bulk-style text
     diffs = {d.name: d for d in diff_exports(export_dir, new)}
     assert not diffs["Account"].touched
