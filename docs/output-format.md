@@ -46,7 +46,7 @@ Written by every run into an existing export folder that finds changes ([time ma
 |---|---|
 | `<Object>.csv` | The new version of each record created, updated or deleted in this run, in the same CSV format as `data/`. Deleted rows have `IsDeleted = "true"` |
 | `<Object>.before.csv` | The version of each of those records before this run (absent for new records) |
-| `run.json` | `stamp`, `started_at`, `finished_at`, `incremental`, and changed records per object |
+| `run.json` | `stamp`, `kind` (`full` or `incremental`), `started_at`, `finished_at`, `since` (the incremental watermark) and `objects` (records changed per object) |
 
 `sf-exit history` and `sf-exit snapshot` read these folders. Keep them and you can see what any record looked like after any run.
 
